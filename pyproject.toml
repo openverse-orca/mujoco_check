@@ -1,0 +1,13 @@
+[project]
+name = "mujoco-check"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "glfw>=2.7.0",
+    "imgui-bundle>=1.6.0",
+    "mujoco>=3.2.0",
+    "numpy>=1.26.0",
+    "orca-gym>=26.10.1",
+]
