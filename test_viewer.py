@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import glfw
 import mujoco
@@ -11,8 +12,7 @@ import numpy as np
 from main import (
     Viewer,
     MIN_CLOSE_ZOOM_FACTOR,
-    add_environment_ground,
-    brighten_environment_ground,
+    ENVIRONMENT_BACKGROUNDS,
     ZOOM_SPEED,
     camera_limits,
     focus_camera,
@@ -285,50 +285,9 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(viewer.selection.joint_id, -1)
         self.assertFalse(viewer.buttons)
 
-    def test_environment_ground_is_decorative_and_not_part_of_model(self):
-        viewer = Viewer()
-        scene = mujoco.MjvScene(viewer.model, maxgeom=2)
-
-        add_environment_ground(scene, viewer.extent, 0.0)
-
-        self.assertEqual(scene.ngeom, 1)
-        self.assertEqual(viewer.model.ngeom, 0)
-        ground = scene.geoms[0]
-        self.assertEqual(ground.objtype, mujoco.mjtObj.mjOBJ_UNKNOWN)
-        self.assertEqual(ground.objid, -1)
-        self.assertEqual(ground.category, mujoco.mjtCatBit.mjCAT_DECOR)
-        np.testing.assert_allclose(ground.rgba, [0.45, 0.55, 0.65, 1.0])
-        self.assertEqual(ground.emission, 0.25)
-
-    def test_blue_environment_brightens_only_existing_ground(self):
-        viewer = Viewer(Path(__file__).with_name("small_scene.xml"))
-        scene = mujoco.MjvScene(viewer.model, maxgeom=100)
-        mujoco.mjv_updateScene(
-            viewer.model,
-            viewer.data,
-            viewer.option,
-            None,
-            viewer.camera,
-            mujoco.mjtCatBit.mjCAT_ALL,
-            scene,
-        )
-        original_ground = scene.geoms[0].rgba.copy()
-        original_sphere = scene.geoms[1].rgba.copy()
-        original_model = viewer.model.geom_rgba.copy()
-
-        brighten_environment_ground(
-            scene, viewer.model, viewer.data, viewer.model_index
-        )
-
-        expected_ground = original_ground.copy()
-        expected_ground[:3] = 0.35 * original_ground[:3] + 0.65 * np.array(
-            [0.48, 0.58, 0.68]
-        )
-        np.testing.assert_allclose(scene.geoms[0].rgba, expected_ground)
-        self.assertEqual(scene.geoms[0].emission, 0.25)
-        np.testing.assert_array_equal(scene.geoms[1].rgba, original_sphere)
-        self.assertEqual(scene.geoms[1].emission, 0.0)
-        np.testing.assert_array_equal(viewer.model.geom_rgba, original_model)
+    def test_environment_backgrounds(self):
+        self.assertEqual(ENVIRONMENT_BACKGROUNDS["blue"], (0.56, 0.74, 0.9, 1.0))
+        self.assertEqual(ENVIRONMENT_BACKGROUNDS["black"], (0.0, 0.0, 0.0, 1.0))
 
     def test_invalid_xml_preserves_current_model(self):
         xml_path = Path(__file__).with_name("small_scene.xml")
@@ -345,6 +304,128 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertIs(viewer.data, old_data)
         self.assertIs(viewer.model_index, old_index)
         self.assertEqual(viewer.xml_path, xml_path.resolve())
+
+
+class OrcaSyncTests(unittest.TestCase):
+    def setUp(self):
+        self.xml_path = Path(__file__).with_name("small_scene.xml")
+
+    def test_start_and_stop_control_worker_lifecycle(self):
+        viewer = Viewer(self.xml_path)
+        viewer.inspector = SimpleNamespace(
+            orca_sync_enabled=False,
+            set_source_status=lambda _text, _error=False: None,
+        )
+        viewer.running = True
+        with patch("main.threading.Thread") as thread_class:
+            viewer.start_orca_sync(" localhost:50051 ")
+            stop_event = viewer.orca_sync_stop
+
+            self.assertTrue(viewer.orca_sync_enabled)
+            self.assertTrue(viewer.inspector.orca_sync_enabled)
+            self.assertFalse(viewer.running)
+            self.assertIsNotNone(stop_event)
+            self.assertEqual(
+                thread_class.call_args.kwargs["args"][1], "localhost:50051"
+            )
+            thread_class.return_value.start.assert_called_once_with()
+
+        viewer.stop_orca_sync()
+        self.assertFalse(viewer.orca_sync_enabled)
+        self.assertFalse(viewer.inspector.orca_sync_enabled)
+        self.assertTrue(stop_event.is_set())
+        self.assertIsNone(viewer.orca_sync_stop)
+
+    def test_remote_snapshot_updates_data_and_forward_kinematics(self):
+        viewer = Viewer(self.xml_path)
+        statuses = []
+        viewer.inspector = SimpleNamespace(
+            orca_sync_enabled=True,
+            set_source_status=lambda text, error=False: statuses.append(
+                (text, error)
+            ),
+        )
+        viewer.orca_sync_enabled = True
+        qpos = viewer.data.qpos.copy()
+        qpos[2] += 0.004
+        qvel = np.linspace(0.1, 0.6, viewer.model.nv)
+        qacc = np.zeros(viewer.model.nv)
+        viewer.orca_sync_results.put_nowait(
+            (viewer.orca_sync_request_id, (qpos, qvel, qacc), None)
+        )
+
+        viewer._process_orca_sync_results()
+
+        np.testing.assert_array_equal(viewer.data.qpos, qpos)
+        np.testing.assert_array_equal(viewer.data.qvel, qvel)
+        np.testing.assert_array_equal(viewer.data.xpos[1], qpos[:3])
+        self.assertTrue(viewer.orca_sync_connected)
+        self.assertEqual(statuses[-1], ("正在同步 OrcaLab 仿真", False))
+
+    def test_stale_snapshot_is_ignored(self):
+        viewer = Viewer(self.xml_path)
+        original_qpos = viewer.data.qpos.copy()
+        changed_qpos = original_qpos.copy()
+        changed_qpos[2] += 0.01
+        viewer.orca_sync_enabled = True
+        viewer.orca_sync_results.put_nowait(
+            (
+                viewer.orca_sync_request_id - 1,
+                (
+                    changed_qpos,
+                    np.zeros(viewer.model.nv),
+                    np.zeros(viewer.model.nv),
+                ),
+                None,
+            )
+        )
+
+        viewer._process_orca_sync_results()
+
+        np.testing.assert_array_equal(viewer.data.qpos, original_qpos)
+        self.assertFalse(viewer.orca_sync_connected)
+
+    def test_mismatched_remote_model_stops_sync_without_changing_data(self):
+        viewer = Viewer(self.xml_path)
+        statuses = []
+        viewer.inspector = SimpleNamespace(
+            orca_sync_enabled=True,
+            set_source_status=lambda text, error=False: statuses.append(
+                (text, error)
+            ),
+        )
+        viewer.orca_sync_enabled = True
+        original_qpos = viewer.data.qpos.copy()
+        viewer.orca_sync_results.put_nowait(
+            (
+                viewer.orca_sync_request_id,
+                (
+                    np.zeros(viewer.model.nq + 1),
+                    np.zeros(viewer.model.nv),
+                    np.zeros(viewer.model.nv),
+                ),
+                None,
+            )
+        )
+
+        viewer._process_orca_sync_results()
+
+        np.testing.assert_array_equal(viewer.data.qpos, original_qpos)
+        self.assertFalse(viewer.orca_sync_enabled)
+        self.assertFalse(viewer.inspector.orca_sync_enabled)
+        self.assertTrue(statuses[-1][1])
+        self.assertIn("状态维度不一致", statuses[-1][0])
+
+    def test_sync_mode_never_steps_local_simulation(self):
+        viewer = Viewer(self.xml_path)
+        viewer.running = True
+        viewer.orca_sync_enabled = True
+        viewer.last_time -= 1.0
+        original_qvel = viewer.data.qvel.copy()
+
+        viewer._step_simulation()
+
+        np.testing.assert_array_equal(viewer.data.qvel, original_qvel)
 
 
 if __name__ == "__main__":

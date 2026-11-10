@@ -89,8 +89,10 @@ class InspectorUI:
         self.file_dialog = None
         self.on_open_xml = None
         self.on_orca_pull = None
+        self.on_orca_sync = None
         self.orca_address = "localhost:50051"
         self.orca_busy = False
+        self.orca_sync_enabled = False
         self.source_status = "请选择本地 XML 或连接 OrcaLab"
         self.source_error = False
         self.xml_name = "未加载模型"
@@ -181,13 +183,24 @@ class InspectorUI:
         spacing = imgui.get_style().item_spacing.x
         address_width = imgui.get_content_region_avail().x - button_width - spacing
         imgui.set_next_item_width(max(address_width, 80.0))
+        imgui.begin_disabled(self.orca_sync_enabled)
         _changed, self.orca_address = imgui.input_text(
             "##OrcaLab 地址", self.orca_address
         )
+        imgui.end_disabled()
         imgui.same_line()
         imgui.begin_disabled(self.orca_busy)
         if imgui.button("拉取 XML") and self.on_orca_pull is not None:
             self.on_orca_pull(self.orca_address)
+        imgui.end_disabled()
+        imgui.begin_disabled(self.orca_busy or not self.xml_text)
+        sync_changed, sync_enabled = imgui.checkbox(
+            "同步 OrcaLab 仿真", self.orca_sync_enabled
+        )
+        if sync_changed:
+            self.orca_sync_enabled = sync_enabled
+            if self.on_orca_sync is not None:
+                self.on_orca_sync(sync_enabled, self.orca_address)
         imgui.end_disabled()
         if self.source_error:
             imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(1.0, 0.35, 0.3, 1.0))
@@ -709,7 +722,7 @@ class InspectorUI:
     def _draw_environment(self, environment_preset):
         imgui.separator_text("场景预设")
         presets = [
-            ("blue", "蓝灰地面 / 浅蓝天空"),
+            ("blue", "浅蓝背景"),
             ("black", "黑色背景"),
         ]
         labels = [label for _preset, label in presets]

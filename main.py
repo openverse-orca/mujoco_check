@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import math
 import queue
 import threading
@@ -9,6 +10,7 @@ import glfw
 import mujoco
 import numpy as np
 from imgui_bundle import imgui
+from OpenGL import GL
 
 from inspection import (
     ModelIndex,
@@ -19,7 +21,7 @@ from inspection import (
     pick_geom,
 )
 from inspector_ui import APP_NAME, InspectorUI
-from model_sources import cleanup_orca_fetch, fetch_orca_xml
+from model_sources import cleanup_orca_fetch, fetch_orca_xml, poll_orca_states
 
 
 ZOOM_SPEED = 0.18
@@ -33,6 +35,10 @@ MIN_DISTANCE_SCALE = 1e-4
 MAX_DISTANCE_SCALE = 1e3
 MIN_WINDOW_WIDTH = 640
 MIN_WINDOW_HEIGHT = 480
+ENVIRONMENT_BACKGROUNDS = {
+    "blue": (0.56, 0.74, 0.9, 1.0),
+    "black": (0.0, 0.0, 0.0, 1.0),
+}
 
 
 def window_resize_edges(width, height, x, y, margin=6):
@@ -204,88 +210,46 @@ def keyboard_move_camera(
     cam.lookat[:] += movement / length * units_per_second * frame_time
 
 
-def add_environment_ground(scene, extent, ground_z):
-    if scene.ngeom >= scene.maxgeom:
-        return
-    extent = _valid_extent(extent)
-    ground_size = extent * 3.0
-    geom = scene.geoms[scene.ngeom]
-    mujoco.mjv_initGeom(
-        geom,
-        mujoco.mjtGeom.mjGEOM_PLANE,
-        np.array([ground_size, ground_size, max(extent * 0.01, 1e-6)]),
-        np.array([0.0, 0.0, ground_z]),
-        np.eye(3).flatten(),
-        np.array([0.45, 0.55, 0.65, 1.0], dtype=np.float32),
+def draw_environment_background(color):
+    GL.glPushAttrib(
+        GL.GL_ENABLE_BIT
+        | GL.GL_DEPTH_BUFFER_BIT
+        | GL.GL_COLOR_BUFFER_BIT
+        | GL.GL_TEXTURE_BIT
+        | GL.GL_CURRENT_BIT
+        | GL.GL_TRANSFORM_BIT
     )
-    geom.objtype = mujoco.mjtObj.mjOBJ_UNKNOWN
-    geom.objid = -1
-    geom.category = mujoco.mjtCatBit.mjCAT_DECOR
-    geom.emission = 0.25
-    scene.ngeom += 1
-
-
-def brighten_environment_ground(scene, model, data, model_index):
-    world_geoms = model_index.body_geoms(0)
-    candidates = []
-    for geom_id in world_geoms:
-        geom_type = int(model.geom_type[geom_id])
-        if geom_type in (
-            int(mujoco.mjtGeom.mjGEOM_PLANE),
-            int(mujoco.mjtGeom.mjGEOM_MESH),
-            int(mujoco.mjtGeom.mjGEOM_HFIELD),
-        ):
-            candidates.append(geom_id)
-        elif geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
-            size = model.geom_size[geom_id]
-            if 2.0 * size[2] <= min(size[0], size[1]):
-                candidates.append(geom_id)
-    if not candidates:
-        return
-    ground_id = min(candidates, key=lambda geom_id: data.geom_xpos[geom_id, 2])
-    ground_color = np.array([0.48, 0.58, 0.68])
-    for index in range(scene.ngeom):
-        geom = scene.geoms[index]
-        if (
-            geom.objtype == mujoco.mjtObj.mjOBJ_GEOM
-            and int(geom.objid) == ground_id
-        ):
-            geom.rgba[:3] = 0.35 * geom.rgba[:3] + 0.65 * ground_color
-            geom.emission = max(float(geom.emission), 0.25)
-            return
-
-
-def add_environment_sky(scene, camera, extent, far, aspect):
-    if scene.ngeom >= scene.maxgeom:
-        return
-    forward = np.asarray(scene.camera[0].forward, dtype=float)
-    up = np.asarray(scene.camera[0].up, dtype=float)
-    if np.linalg.norm(forward) == 0.0 or np.linalg.norm(up) == 0.0:
-        return
-    forward = forward / np.linalg.norm(forward)
-    right = np.cross(forward, up)
-    right = right / np.linalg.norm(right)
-    up = np.cross(right, forward)
-    extent = _valid_extent(extent)
-    depth = max(min(camera.distance + extent * 5.0, far * 0.8), extent * 0.1)
-    sky_height = depth * 2.0
-    sky_width = sky_height * max(float(aspect), 1.0)
-    geom = scene.geoms[scene.ngeom]
-    mujoco.mjv_initGeom(
-        geom,
-        mujoco.mjtGeom.mjGEOM_PLANE,
-        np.array([sky_width, sky_height, max(extent * 0.01, 1e-6)]),
-        np.asarray(camera.lookat, dtype=float) + forward * depth,
-        np.column_stack((right, up, -forward)).flatten(),
-        np.array([0.56, 0.74, 0.9, 1.0], dtype=np.float32),
-    )
-    geom.objtype = mujoco.mjtObj.mjOBJ_UNKNOWN
-    geom.objid = -1
-    geom.category = mujoco.mjtCatBit.mjCAT_DECOR
-    geom.emission = 0.5
-    geom.specular = 0.0
-    geom.shininess = 0.0
-    scene.ngeom += 1
+    GL.glMatrixMode(GL.GL_PROJECTION)
+    GL.glPushMatrix()
+    GL.glMatrixMode(GL.GL_MODELVIEW)
+    GL.glPushMatrix()
+    try:
+        GL.glLoadIdentity()
+        GL.glMatrixMode(GL.GL_PROJECTION)
+        GL.glLoadIdentity()
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glDisable(GL.GL_CULL_FACE)
+        GL.glDisable(GL.GL_LIGHTING)
+        GL.glDisable(GL.GL_FOG)
+        GL.glDisable(GL.GL_TEXTURE_2D)
+        GL.glDisable(GL.GL_TEXTURE_CUBE_MAP)
+        GL.glDisable(GL.GL_SCISSOR_TEST)
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendEquation(GL.GL_FUNC_ADD)
+        GL.glBlendFunc(GL.GL_ONE_MINUS_DST_ALPHA, GL.GL_ONE)
+        GL.glColor4f(*color)
+        GL.glBegin(GL.GL_QUADS)
+        GL.glVertex2f(-1.0, -1.0)
+        GL.glVertex2f(1.0, -1.0)
+        GL.glVertex2f(1.0, 1.0)
+        GL.glVertex2f(-1.0, 1.0)
+        GL.glEnd()
+    finally:
+        GL.glMatrixMode(GL.GL_MODELVIEW)
+        GL.glPopMatrix()
+        GL.glMatrixMode(GL.GL_PROJECTION)
+        GL.glPopMatrix()
+        GL.glPopAttrib()
 
 
 class Viewer:
@@ -340,6 +304,11 @@ class Viewer:
         self.orca_results = queue.SimpleQueue()
         self.orca_request_id = 0
         self.orca_loading = False
+        self.orca_sync_results = queue.Queue(maxsize=1)
+        self.orca_sync_request_id = 0
+        self.orca_sync_stop = None
+        self.orca_sync_enabled = False
+        self.orca_sync_connected = False
         self.shutting_down = threading.Event()
 
     @property
@@ -372,6 +341,7 @@ class Viewer:
                 context.free()
             raise
 
+        self.stop_orca_sync()
         old_context = self.context
         self.xml_path = path
         self.xml_text = xml_text
@@ -414,6 +384,7 @@ class Viewer:
         address = address.strip()
         if not address or self.orca_loading:
             return
+        self.stop_orca_sync()
         self.orca_request_id += 1
         request_id = self.orca_request_id
         self.orca_loading = True
@@ -460,6 +431,119 @@ class Viewer:
                 self._set_source_status(f"已从 OrcaLab 加载：{self.model_name}")
             finally:
                 cleanup_orca_fetch(cache_dir)
+
+    def set_orca_sync(self, enabled, address):
+        if enabled:
+            self.start_orca_sync(address)
+        else:
+            self.stop_orca_sync(notify=True)
+
+    def start_orca_sync(self, address):
+        address = address.strip()
+        if not address or self.xml_path is None or self.orca_loading:
+            if self.inspector is not None:
+                self.inspector.orca_sync_enabled = False
+            if not address:
+                self._set_source_status("OrcaLab 地址不能为空", True)
+            elif self.xml_path is None:
+                self._set_source_status("请先加载与 OrcaLab 对应的 XML", True)
+            else:
+                self._set_source_status("请等待 OrcaLab XML 加载完成", True)
+            return
+
+        self.stop_orca_sync()
+        self.running = False
+        self.accumulator = 0.0
+        self.orca_sync_request_id += 1
+        request_id = self.orca_sync_request_id
+        stop_event = threading.Event()
+        self.orca_sync_stop = stop_event
+        self.orca_sync_enabled = True
+        if self.inspector is not None:
+            self.inspector.orca_sync_enabled = True
+        self._set_source_status(f"正在连接 OrcaLab 同步：{address}")
+        threading.Thread(
+            target=self._orca_sync_worker,
+            args=(request_id, address, stop_event),
+            daemon=True,
+        ).start()
+
+    def stop_orca_sync(self, notify=False):
+        was_enabled = self.orca_sync_enabled
+        self.orca_sync_request_id += 1
+        self.orca_sync_enabled = False
+        self.orca_sync_connected = False
+        if self.orca_sync_stop is not None:
+            self.orca_sync_stop.set()
+            self.orca_sync_stop = None
+        if self.inspector is not None:
+            self.inspector.orca_sync_enabled = False
+        if notify and was_enabled:
+            self._set_source_status("已停止 OrcaLab 同步，当前为查看模式")
+
+    def _queue_orca_sync_result(self, result):
+        while True:
+            try:
+                self.orca_sync_results.put_nowait(result)
+                return
+            except queue.Full:
+                try:
+                    self.orca_sync_results.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def _orca_sync_worker(self, request_id, address, stop_event):
+        try:
+            asyncio.run(
+                poll_orca_states(
+                    address,
+                    lambda state: self._queue_orca_sync_result(
+                        (request_id, state, None)
+                    ),
+                    stop_event,
+                )
+            )
+        except Exception as error:
+            if not stop_event.is_set() and not self.shutting_down.is_set():
+                self._queue_orca_sync_result((request_id, None, str(error)))
+
+    def _process_orca_sync_results(self):
+        while True:
+            try:
+                request_id, state, error = self.orca_sync_results.get_nowait()
+            except queue.Empty:
+                break
+            if request_id != self.orca_sync_request_id or not self.orca_sync_enabled:
+                continue
+            if error is not None:
+                self.stop_orca_sync()
+                self._set_source_status(f"OrcaLab 同步失败：{error}", True)
+                continue
+
+            try:
+                qpos, qvel, qacc = (
+                    np.asarray(values, dtype=float) for values in state
+                )
+                if (
+                    qpos.shape != (self.model.nq,)
+                    or qvel.shape != (self.model.nv,)
+                    or qacc.shape != (self.model.nv,)
+                ):
+                    raise ValueError("远端模型与当前 XML 的状态维度不一致")
+                if not all(np.all(np.isfinite(values)) for values in (qpos, qvel, qacc)):
+                    raise ValueError("远端仿真状态包含无效数值")
+                self.data.qpos[:] = qpos
+                self.data.qvel[:] = qvel
+                self.data.qacc[:] = qacc
+                mujoco.mj_forward(self.model, self.data)
+            except (TypeError, ValueError, RuntimeError) as state_error:
+                self.stop_orca_sync()
+                self._set_source_status(f"OrcaLab 同步失败：{state_error}", True)
+                continue
+
+            if not self.orca_sync_connected:
+                self.orca_sync_connected = True
+                self._set_source_status("正在同步 OrcaLab 仿真")
 
     def _aspect_ratio(self):
         if self.window is None:
@@ -638,13 +722,17 @@ class Viewer:
             return
         if key == glfw.KEY_ESCAPE:
             glfw.set_window_should_close(window, True)
-        elif key == glfw.KEY_SPACE:
+        elif key == glfw.KEY_SPACE and not self.orca_sync_enabled:
             self.running = not self.running
             self.accumulator = 0.0
             self._update_title()
-        elif key == glfw.KEY_PERIOD and not self.running:
+        elif (
+            key == glfw.KEY_PERIOD
+            and not self.running
+            and not self.orca_sync_enabled
+        ):
             mujoco.mj_step(self.model, self.data)
-        elif key == glfw.KEY_R:
+        elif key == glfw.KEY_R and not self.orca_sync_enabled:
             mujoco.mj_resetData(self.model, self.data)
             mujoco.mj_forward(self.model, self.data)
             self.accumulator = 0.0
@@ -674,7 +762,7 @@ class Viewer:
                 self.extent,
                 self.pan_speed,
             )
-        if not self.running:
+        if not self.running or self.orca_sync_enabled:
             return
 
         self.accumulator += frame_time
@@ -763,21 +851,12 @@ class Viewer:
             self.pending_pick = None
             if self.selection.valid:
                 self.inspector.reveal_body(self.selection.body_id)
-        if self.environment_preset == "blue":
-            if self.model_index.body_geoms(0):
-                brighten_environment_ground(
-                    self.scene, self.model, self.data, self.model_index
-                )
-            else:
-                ground_z = min(0.0, float(self.center[2] - self.extent))
-                add_environment_ground(self.scene, self.extent, ground_z)
-            add_environment_sky(
-                self.scene, self.camera, self.extent, far, width / height
-            )
         apply_highlight(self.scene, self.selection, self.model_index)
 
         viewport = mujoco.MjrRect(0, 0, width, height)
         mujoco.mjr_render(viewport, self.scene, self.context)
+        if self.environment_preset == "blue":
+            draw_environment_background(ENVIRONMENT_BACKGROUNDS["blue"])
         self.inspector.draw_object_label(self.selection, self.scene, (width, height))
         self.inspector.end_frame()
         glfw.swap_buffers(self.window)
@@ -810,6 +889,7 @@ class Viewer:
             )
             self.inspector.on_open_xml = self.load_local_xml
             self.inspector.on_orca_pull = self.start_orca_fetch
+            self.inspector.on_orca_sync = self.set_orca_sync
             self.inspector.rebind_model(
                 self.model,
                 self.data,
@@ -844,6 +924,7 @@ class Viewer:
             while not glfw.window_should_close(self.window):
                 glfw.poll_events()
                 self._process_orca_results()
+                self._process_orca_sync_results()
                 self._step_simulation()
                 width, height = glfw.get_framebuffer_size(self.window)
                 if width <= 0 or height <= 0:
@@ -852,6 +933,7 @@ class Viewer:
                 self._render()
         finally:
             self.shutting_down.set()
+            self.stop_orca_sync()
             self.orca_request_id += 1
             self._process_orca_results()
             if self.inspector is not None:

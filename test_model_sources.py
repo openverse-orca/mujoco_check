@@ -1,11 +1,18 @@
 import asyncio
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import numpy as np
 from orca_gym.core import orca_gym_local
-from model_sources import cleanup_orca_fetch, download_orca_xml, fetch_orca_xml
+from model_sources import (
+    cleanup_orca_fetch,
+    download_orca_xml,
+    fetch_orca_xml,
+    poll_orca_states,
+)
 
 
 class DownloadOrcaXmlTests(unittest.IsolatedAsyncioTestCase):
@@ -28,7 +35,10 @@ class DownloadOrcaXmlTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, Path("/tmp/cache/scene.xml"))
-        insecure_channel.assert_called_once_with("localhost:50051")
+        insecure_channel.assert_called_once_with(
+            "localhost:50051",
+            options=(("grpc.max_receive_message_length", 64 * 1024 * 1024),),
+        )
         stub_class.assert_called_once_with(channel)
         gym_class.assert_called_once_with(stub, xml_assets_dir=str(directory))
         gym.load_model_xml.assert_awaited_once_with()
@@ -91,6 +101,62 @@ class DownloadOrcaXmlTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(RuntimeError) as caught:
             await download_orca_xml("localhost:50051", "/tmp/cache")
+
+        self.assertIs(caught.exception, error)
+        channel.close.assert_awaited_once_with()
+
+
+class PollOrcaStatesTests(unittest.IsolatedAsyncioTestCase):
+    @patch("model_sources.OrcaGymRemote")
+    @patch("model_sources.GrpcServiceStub")
+    @patch("model_sources.grpc.aio.insecure_channel")
+    async def test_poll_publishes_state_and_closes_channel(
+        self, insecure_channel, stub_class, gym_class
+    ):
+        channel = insecure_channel.return_value
+        channel.close = AsyncMock()
+        state = (
+            np.array([1.0, 2.0]),
+            np.array([3.0, 4.0]),
+            np.array([5.0, 6.0]),
+        )
+        gym_class.return_value.query_all_qpos_qvel_qacc = AsyncMock(
+            return_value=state
+        )
+        stop_event = threading.Event()
+        published = []
+
+        def publish(received_state):
+            published.append(received_state)
+            stop_event.set()
+
+        await poll_orca_states(
+            "localhost:50051", publish, stop_event, interval=0.0
+        )
+
+        self.assertEqual(len(published), 1)
+        for received, expected in zip(published[0], state):
+            np.testing.assert_array_equal(received, expected)
+        gym_class.assert_called_once_with(stub_class.return_value)
+        channel.close.assert_awaited_once_with()
+
+    @patch("model_sources.OrcaGymRemote")
+    @patch("model_sources.GrpcServiceStub")
+    @patch("model_sources.grpc.aio.insecure_channel")
+    async def test_query_error_propagates_and_closes_channel(
+        self, insecure_channel, _stub_class, gym_class
+    ):
+        channel = insecure_channel.return_value
+        channel.close = AsyncMock()
+        error = RuntimeError("query failed")
+        gym_class.return_value.query_all_qpos_qvel_qacc = AsyncMock(
+            side_effect=error
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            await poll_orca_states(
+                "localhost:50051", lambda _state: None, threading.Event()
+            )
 
         self.assertIs(caught.exception, error)
         channel.close.assert_awaited_once_with()
