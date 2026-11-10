@@ -313,6 +313,7 @@ class Viewer:
         self.camera = mujoco.MjvCamera()
         self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
         self.option = mujoco.MjvOption()
+        self.option.geomgroup[:] = 1
         self.scene = None
         self.context = None
         self.window = None
@@ -338,6 +339,7 @@ class Viewer:
         self.left_dragging = False
         self.resizing_window = False
         self.resize_edges = ()
+        self.resize_origin = None
         self.pending_pick = None
         self.orca_results = queue.SimpleQueue()
         self.orca_request_id = 0
@@ -839,6 +841,7 @@ class Viewer:
         ):
             self.resizing_window = False
             self.resize_edges = ()
+            self.resize_origin = None
             self.last_cursor = None
             return
         if action == glfw.PRESS:
@@ -849,8 +852,17 @@ class Viewer:
                 cursor = glfw.get_cursor_pos(window)
                 edges = window_resize_edges(width, height, *cursor)
                 if edges:
+                    window_x, window_y = glfw.get_window_pos(window)
                     self.resizing_window = True
                     self.resize_edges = edges
+                    self.resize_origin = (
+                        window_x,
+                        window_y,
+                        width,
+                        height,
+                        window_x + cursor[0],
+                        window_y + cursor[1],
+                    )
                     self.last_cursor = cursor
                     return
             if imgui.get_io().want_capture_mouse:
@@ -897,15 +909,12 @@ class Viewer:
         self.inspector.backend.mouse_callback(window, x, y)
         if self.resizing_window:
             if self.last_cursor is not None:
-                dx = x - self.last_cursor[0]
-                dy = y - self.last_cursor[1]
+                origin = self.resize_origin
                 window_x, window_y = glfw.get_window_pos(window)
-                width, height = glfw.get_window_size(window)
+                dx = window_x + x - origin[4]
+                dy = window_y + y - origin[5]
                 new_x, new_y, new_width, new_height = resized_window_geometry(
-                    window_x,
-                    window_y,
-                    width,
-                    height,
+                    *origin[:4],
                     self.resize_edges,
                     dx,
                     dy,
@@ -985,6 +994,7 @@ class Viewer:
             self.left_dragging = False
             self.resizing_window = False
             self.resize_edges = ()
+            self.resize_origin = None
             self.pending_pick = None
 
     def _on_key(self, window, key, scancode, action, mods):

@@ -5,7 +5,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import glfw
 import mujoco
@@ -271,6 +271,36 @@ class WindowFrameTests(unittest.TestCase):
         self.assertTrue(all(isinstance(value, int) for value in geometry))
         self.assertEqual(geometry, (110, 200, 1270, 821))
 
+    def test_resize_uses_drag_origin_when_window_size_updates_are_delayed(self):
+        viewer = Viewer(str(Path(__file__).with_name("small_scene.xml")))
+        viewer.window = object()
+        viewer.inspector = SimpleNamespace(
+            backend=SimpleNamespace(mouse_callback=lambda *_args: None)
+        )
+        viewer.resizing_window = True
+        viewer.resize_edges = ("right", "bottom")
+        viewer.resize_origin = (100, 100, 800, 600, 880, 680)
+        viewer.last_cursor = (780, 580)
+
+        with (
+            patch("main.glfw.get_window_pos", return_value=(100, 100)),
+            patch("main.glfw.get_window_size", return_value=(800, 600)),
+            patch("main.glfw.set_window_size") as set_window_size,
+        ):
+            for total_x, total_y in ((50, 40), (100, 80), (150, 120)):
+                viewer._on_cursor_pos(
+                    viewer.window, 780 + total_x, 580 + total_y
+                )
+
+        self.assertEqual(
+            set_window_size.call_args_list,
+            [
+                call(viewer.window, 850, 640),
+                call(viewer.window, 900, 680),
+                call(viewer.window, 950, 720),
+            ],
+        )
+
 
 class ModelLoadingTests(unittest.TestCase):
     def test_cli_can_connect_to_orca_on_startup(self):
@@ -293,6 +323,7 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(viewer.pan_speed, 6.0)
         self.assertEqual(viewer.near_clip_ratio, 0.001)
         self.assertEqual(viewer.environment_preset, "blue")
+        np.testing.assert_array_equal(viewer.option.geomgroup, np.ones(6))
         self.assertEqual(viewer.xml_text, "")
 
     def test_xml_reload_replaces_model_and_resets_interaction(self):
