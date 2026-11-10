@@ -11,6 +11,7 @@ from inspection import (
     Selection,
     apply_highlight,
     body_focus,
+    joint_focus,
     pick_geom,
     project_to_window,
     relative_cursor_position,
@@ -181,7 +182,71 @@ class SelectionTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(self.model.geom_rgba, original_model)
 
-    def test_body_highlight_only_affects_owned_visible_geoms(self):
+    def test_joint_focus_uses_current_anchor(self):
+        center, radius = joint_focus(self.model, self.data, 0)
+
+        np.testing.assert_array_equal(center, self.data.xanchor[0])
+        expected = max(
+            min(
+                float(self.model.vis.scale.jointwidth) * 8.0,
+                float(self.model.stat.extent) * 0.05,
+            ),
+            1e-6,
+        )
+        self.assertEqual(radius, expected)
+
+    def test_joint_highlight_only_affects_selected_joint(self):
+        model = mujoco.MjModel.from_xml_string(
+            """
+            <mujoco>
+              <worldbody>
+                <body name="first" pos="0 0 1">
+                  <joint name="first_joint" axis="0 0 1"/>
+                  <geom type="box" size="0.1 0.1 0.1"/>
+                </body>
+                <body name="second" pos="1 0 1">
+                  <joint name="second_joint" axis="0 1 0"/>
+                  <geom type="box" size="0.1 0.1 0.1"/>
+                </body>
+              </worldbody>
+            </mujoco>
+            """
+        )
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        option = mujoco.MjvOption()
+        option.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = 1
+        scene = mujoco.MjvScene(model, maxgeom=100)
+        mujoco.mjv_updateScene(
+            model,
+            data,
+            option,
+            None,
+            mujoco.MjvCamera(),
+            mujoco.mjtCatBit.mjCAT_ALL,
+            scene,
+        )
+        index = ModelIndex(model)
+
+        apply_highlight(scene, Selection(1, -1, 0), index)
+
+        selected = [
+            scene.geoms[i]
+            for i in range(scene.ngeom)
+            if scene.geoms[i].objtype == mujoco.mjtObj.mjOBJ_JOINT
+            and scene.geoms[i].objid == 0
+        ]
+        self.assertTrue(selected)
+        for geom in selected:
+            self.assertAlmostEqual(geom.emission, 0.65)
+        for i in range(scene.ngeom):
+            geom = scene.geoms[i]
+            if geom.objtype == mujoco.mjtObj.mjOBJ_JOINT and geom.objid == 1:
+                self.assertEqual(geom.emission, 0.0)
+            elif geom.objtype == mujoco.mjtObj.mjOBJ_GEOM:
+                self.assertEqual(geom.emission, 0.0)
+
+    def test_body_highlight_distinguishes_owned_and_descendant_geoms(self):
         self._update_scene()
         original_cube = self._scene_geom(self.cube_id).rgba.copy()
 
@@ -189,8 +254,12 @@ class SelectionTests(unittest.TestCase):
 
         for geom_id in self.world_geom_ids:
             self.assertAlmostEqual(self._scene_geom(geom_id).emission, 0.65)
-        np.testing.assert_array_equal(self._scene_geom(self.cube_id).rgba, original_cube)
-        self.assertEqual(self._scene_geom(self.cube_id).emission, 0.0)
+        expected_cube = original_cube.copy()
+        expected_cube[:3] = 0.65 * original_cube[:3] + 0.35 * np.array(
+            [1.0, 0.75, 0.1]
+        )
+        np.testing.assert_allclose(self._scene_geom(self.cube_id).rgba, expected_cube)
+        self.assertAlmostEqual(self._scene_geom(self.cube_id).emission, 0.18)
 
     def test_hidden_group_is_absent_from_scene_and_highlight(self):
         self.option.geomgroup[1] = 0

@@ -8,6 +8,11 @@ from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 from inspection import body_focus, project_to_window
 
 
+APP_NAME = "MuJoCo 模型检查器"
+TITLE_BAR_HEIGHT = 52
+SPLITTER_WIDTH = 18
+
+
 FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
@@ -28,11 +33,18 @@ def _geom_type(geom_type):
 
 def _begin_properties(table_id):
     flags = imgui.TableFlags_.sizing_stretch_prop | imgui.TableFlags_.no_saved_settings
+    imgui.push_id(table_id)
     if not imgui.begin_table(table_id, 2, flags):
+        imgui.pop_id()
         return False
     imgui.table_setup_column("属性", imgui.TableColumnFlags_.width_fixed, 130.0)
     imgui.table_setup_column("值", imgui.TableColumnFlags_.width_stretch)
     return True
+
+
+def _end_properties():
+    imgui.end_table()
+    imgui.pop_id()
 
 
 def _property_row(label, value):
@@ -40,7 +52,20 @@ def _property_row(label, value):
     imgui.table_set_column_index(0)
     imgui.text_disabled(label)
     imgui.table_set_column_index(1)
-    imgui.text_wrapped(str(value))
+    imgui.set_next_item_width(-1)
+    imgui.input_text(
+        f"##property_{label}", str(value), imgui.InputTextFlags_.read_only
+    )
+
+
+def _copy_name_popup(name):
+    if imgui.begin_popup_context_item():
+        try:
+            _selected, clicked = imgui.selectable("复制名称", False)
+            if clicked:
+                imgui.set_clipboard_text(name)
+        finally:
+            imgui.end_popup()
 
 
 class InspectorUI:
@@ -60,6 +85,7 @@ class InspectorUI:
         self.open_bodies = set()
         self.scroll_body = None
         self.focus_body = None
+        self.window_drag_origin = None
         self.file_dialog = None
         self.on_open_xml = None
         self.on_orca_pull = None
@@ -67,6 +93,15 @@ class InspectorUI:
         self.orca_busy = False
         self.source_status = "请选择本地 XML 或连接 OrcaLab"
         self.source_error = False
+        self.xml_name = "未加载模型"
+        self.xml_text = ""
+        self.xml_content_width = None
+        self.xml_popup_open = False
+        self.xml_lines = []
+        self.xml_search_text = ""
+        self.xml_search_matches = []
+        self.xml_search_index = -1
+        self.xml_scroll_line = None
 
         imgui.create_context()
         try:
@@ -100,10 +135,18 @@ class InspectorUI:
         self.focus_body = None
         return body_id
 
-    def rebind_model(self, model, data, model_index):
+    def rebind_model(self, model, data, model_index, xml_name, xml_text):
         self.model = model
         self.data = data
         self.index = model_index
+        self.xml_name = xml_name
+        self.xml_text = xml_text
+        self.xml_content_width = None
+        self.xml_lines = xml_text.splitlines()
+        self.xml_search_text = ""
+        self.xml_search_matches = []
+        self.xml_search_index = -1
+        self.xml_scroll_line = None
         self.open_bodies.clear()
         self.scroll_body = None
         self.focus_body = None
@@ -154,6 +197,87 @@ class InspectorUI:
             imgui.text_wrapped(self.source_status)
         imgui.spacing()
 
+    def _toggle_window_maximized(self):
+        if glfw.get_window_attrib(self.window, glfw.MAXIMIZED):
+            glfw.restore_window(self.window)
+        else:
+            glfw.maximize_window(self.window)
+
+    def _draw_window_title_bar(self, window_width):
+        flags = (
+            imgui.WindowFlags_.no_title_bar
+            | imgui.WindowFlags_.no_resize
+            | imgui.WindowFlags_.no_move
+            | imgui.WindowFlags_.no_scrollbar
+            | imgui.WindowFlags_.no_saved_settings
+        )
+        imgui.set_next_window_pos(imgui.ImVec2(0, 0), imgui.Cond_.always)
+        imgui.set_next_window_size(
+            imgui.ImVec2(window_width, TITLE_BAR_HEIGHT), imgui.Cond_.always
+        )
+        imgui.push_style_color(imgui.Col_.window_bg, (0.055, 0.065, 0.085, 1.0))
+        imgui.push_style_var(imgui.StyleVar_.window_padding, imgui.ImVec2(0, 0))
+        imgui.push_style_var(imgui.StyleVar_.window_border_size, 0.0)
+        imgui.begin("##application_title_bar", flags=flags)
+        try:
+            origin = imgui.get_cursor_screen_pos()
+            button_size = imgui.ImVec2(52, TITLE_BAR_HEIGHT)
+            spacing = imgui.get_style().item_spacing.x
+            drag_width = max(
+                0.0, window_width - button_size.x * 3.0 - spacing * 3.0
+            )
+            imgui.invisible_button(
+                "##window_drag", imgui.ImVec2(drag_width, TITLE_BAR_HEIGHT)
+            )
+            if imgui.is_item_hovered() and imgui.is_mouse_double_clicked(0):
+                self._toggle_window_maximized()
+            if imgui.is_item_active():
+                if not glfw.get_window_attrib(self.window, glfw.MAXIMIZED):
+                    x, y = glfw.get_window_pos(self.window)
+                    cursor_x, cursor_y = glfw.get_cursor_pos(self.window)
+                    if self.window_drag_origin is None:
+                        self.window_drag_origin = (
+                            x + cursor_x,
+                            y + cursor_y,
+                            x,
+                            y,
+                        )
+                    if imgui.is_mouse_dragging(0):
+                        start_mouse_x, start_mouse_y, start_x, start_y = (
+                            self.window_drag_origin
+                        )
+                        glfw.set_window_pos(
+                            self.window,
+                            round(start_x + x + cursor_x - start_mouse_x),
+                            round(start_y + y + cursor_y - start_mouse_y),
+                        )
+            else:
+                self.window_drag_origin = None
+            imgui.get_window_draw_list().add_text(
+                imgui.ImVec2(origin.x + 16.0, origin.y + 7.0),
+                imgui.get_color_u32(imgui.Col_.text),
+                APP_NAME,
+            )
+            imgui.push_style_color(imgui.Col_.button, (0.0, 0.0, 0.0, 0.0))
+            imgui.push_style_color(imgui.Col_.button_hovered, (0.0, 0.0, 0.0, 0.0))
+            imgui.push_style_color(imgui.Col_.button_active, (0.0, 0.0, 0.0, 0.0))
+            try:
+                imgui.same_line()
+                if imgui.button("—##minimize", button_size):
+                    glfw.iconify_window(self.window)
+                imgui.same_line()
+                if imgui.button("□##maximize", button_size):
+                    self._toggle_window_maximized()
+                imgui.same_line()
+                if imgui.button("×##close", button_size):
+                    glfw.set_window_should_close(self.window, True)
+            finally:
+                imgui.pop_style_color(3)
+        finally:
+            imgui.end()
+            imgui.pop_style_var(2)
+            imgui.pop_style_color()
+
     def _draw_splitter(self, name, x, height, flags):
         splitter_flags = (
             flags
@@ -161,8 +285,13 @@ class InspectorUI:
             | imgui.WindowFlags_.no_scrollbar
             | imgui.WindowFlags_.no_scroll_with_mouse
         )
-        imgui.set_next_window_pos(imgui.ImVec2(x - 5, 0), imgui.Cond_.always)
-        imgui.set_next_window_size(imgui.ImVec2(10, height), imgui.Cond_.always)
+        imgui.set_next_window_pos(
+            imgui.ImVec2(x - SPLITTER_WIDTH * 0.5, TITLE_BAR_HEIGHT),
+            imgui.Cond_.always,
+        )
+        imgui.set_next_window_size(
+            imgui.ImVec2(SPLITTER_WIDTH, height), imgui.Cond_.always
+        )
         imgui.push_style_var(imgui.StyleVar_.window_min_size, imgui.ImVec2(1, 1))
         imgui.push_style_var(imgui.StyleVar_.window_padding, imgui.ImVec2(0, 0))
         imgui.begin(name, flags=splitter_flags)
@@ -177,9 +306,13 @@ class InspectorUI:
             imgui.end()
             imgui.pop_style_var(2)
 
-    def draw(self, selection, zoom_speed, pan_speed):
+    def draw(
+        self, selection, zoom_speed, pan_speed, environment_preset, near_clip_ratio
+    ):
         self._poll_file_dialog()
         window_width, window_height = glfw.get_window_size(self.window)
+        self._draw_window_title_bar(window_width)
+        panel_height = max(0, window_height - TITLE_BAR_HEIGHT)
         panel_width = min(self.right_panel_width, window_width)
         tree_width = min(self.left_panel_width, window_width - panel_width)
         flags = (
@@ -190,22 +323,29 @@ class InspectorUI:
         )
 
         if tree_width > 0:
-            imgui.set_next_window_pos(imgui.ImVec2(0, 0), imgui.Cond_.always)
+            imgui.set_next_window_pos(
+                imgui.ImVec2(0, TITLE_BAR_HEIGHT), imgui.Cond_.always
+            )
             imgui.set_next_window_size(
-                imgui.ImVec2(tree_width, window_height), imgui.Cond_.always
+                imgui.ImVec2(tree_width, panel_height), imgui.Cond_.always
             )
             imgui.begin("Body 层级", flags=flags)
             try:
                 self._draw_model_sources()
-                self._draw_body_tree(selection)
+                imgui.push_style_var(imgui.StyleVar_.indent_spacing, 48.0)
+                try:
+                    self._draw_body_tree(selection)
+                finally:
+                    imgui.pop_style_var()
             finally:
                 imgui.end()
 
         imgui.set_next_window_pos(
-            imgui.ImVec2(window_width - panel_width, 0), imgui.Cond_.always
+            imgui.ImVec2(window_width - panel_width, TITLE_BAR_HEIGHT),
+            imgui.Cond_.always,
         )
         imgui.set_next_window_size(
-            imgui.ImVec2(panel_width, window_height), imgui.Cond_.always
+            imgui.ImVec2(panel_width, panel_height), imgui.Cond_.always
         )
         imgui.begin("检查面板", flags=flags)
         try:
@@ -225,6 +365,19 @@ class InspectorUI:
 
                     display_tab, _open = imgui.begin_tab_item("显示设置")
                     if display_tab:
+                        environment_preset = self._draw_environment(environment_preset)
+                        imgui.text("近切面距离 (相机距离 %)")
+                        imgui.set_next_item_width(-1)
+                        changed, near_percent = imgui.slider_float(
+                            "##近切面距离",
+                            near_clip_ratio * 100.0,
+                            0.001,
+                            100.0,
+                            "%.3f",
+                            imgui.SliderFlags_.logarithmic,
+                        )
+                        if changed:
+                            near_clip_ratio = near_percent / 100.0
                         self._draw_groups()
                         self._draw_visual_flags()
                         imgui.separator_text("交互速度")
@@ -242,34 +395,58 @@ class InspectorUI:
                         )
                         imgui.text_disabled("接近场景时自动精细缩放和平移")
                         imgui.end_tab_item()
+
+                    xml_tab, _open = imgui.begin_tab_item("XML 源码")
+                    if xml_tab:
+                        if self.xml_popup_open:
+                            imgui.text_wrapped(
+                                "XML 源码已在弹出窗口中打开，关闭窗口可返回此处。"
+                            )
+                        else:
+                            imgui.begin_disabled(not self.xml_text)
+                            if imgui.button("弹出 XML 查看器"):
+                                self.xml_popup_open = True
+                            imgui.end_disabled()
+                            self._draw_xml_editor()
+                        imgui.end_tab_item()
                 finally:
                     imgui.end_tab_bar()
         finally:
             imgui.end()
 
         if tree_width > 0:
-            left_delta = self._draw_splitter("左侧分隔条", tree_width, window_height, flags)
+            left_delta = self._draw_splitter("左侧分隔条", tree_width, panel_height, flags)
             max_left = max(0.0, window_width - panel_width - 120.0)
             min_left = min(220.0, max_left)
             self.left_panel_width = min(
                 max_left, max(min_left, self.left_panel_width + left_delta)
             )
         right_delta = self._draw_splitter(
-            "右侧分隔条", window_width - panel_width - 5.0, window_height, flags
+            "右侧分隔条",
+            window_width - panel_width - SPLITTER_WIDTH * 0.5,
+            panel_height,
+            flags,
         )
         max_right = max(0.0, window_width - tree_width - 120.0)
         min_right = min(300.0, max_right)
         self.right_panel_width = min(
             max_right, max(min_right, self.right_panel_width - right_delta)
         )
+        self._draw_xml_popup()
         self.open_bodies.clear()
         self.scroll_body = None
-        return selection, zoom_speed, pan_speed
+        return selection, zoom_speed, pan_speed, environment_preset, near_clip_ratio
 
     def draw_object_label(self, selection, scene, framebuffer_size):
         if not selection.valid:
             return
-        if selection.geom_id >= 0:
+        if selection.joint_id >= 0:
+            point = self.data.xanchor[selection.joint_id]
+            text = (
+                f"{self.index.joint_name(selection.joint_id)} · "
+                f"{self.index.body_name(selection.body_id)}"
+            )
+        elif selection.geom_id >= 0:
             point = self.data.geom_xpos[selection.geom_id]
             text = (
                 f"{self.index.geom_name(selection.geom_id)} · "
@@ -306,7 +483,7 @@ class InspectorUI:
             | imgui.WindowFlags_.no_nav
         )
         if self.label_font is not None:
-            imgui.push_font(self.label_font)
+            imgui.push_font(self.label_font, 20.0)
         imgui.push_style_var(imgui.StyleVar_.window_padding, imgui.ImVec2(10, 6))
         try:
             imgui.begin("选中对象##object_label", flags=label_flags)
@@ -342,7 +519,7 @@ class InspectorUI:
                 _property_row("当前 xquat", _vector(data.xquat[body_id]))
                 _property_row("Geom 数", len(self.index.body_geoms(body_id)))
                 _property_row("Joint 数", len(self.index.body_joints(body_id)))
-                imgui.end_table()
+                _end_properties()
 
         if selection.geom_id >= 0 and imgui.collapsing_header("Geom", flags=default_open):
             geom_id = selection.geom_id
@@ -356,16 +533,20 @@ class InspectorUI:
                 _property_row("pos", _vector(model.geom_pos[geom_id]))
                 _property_row("quat", _vector(model.geom_quat[geom_id]))
                 _property_row("rgba", _vector(model.geom_rgba[geom_id]))
-                imgui.end_table()
+                _end_properties()
 
         if imgui.collapsing_header("Joints", flags=default_open):
+            imgui.indent()
             joints = self.index.body_joints(body_id)
+            if selection.joint_id in joints:
+                joints = (selection.joint_id,)
             if not joints:
                 imgui.text_disabled("当前 Body 无 Joint")
             for joint_id in joints:
                 joint_flags = default_open if len(joints) == 1 else 0
                 title = f"[{joint_id}] {self.index.joint_name(joint_id)}"
                 if imgui.collapsing_header(title, flags=joint_flags):
+                    imgui.indent()
                     if _begin_properties(f"joint_properties_{joint_id}"):
                         _property_row("类型", _joint_type(model.jnt_type[joint_id]))
                         _property_row("pos", _vector(model.jnt_pos[joint_id]))
@@ -374,7 +555,177 @@ class InspectorUI:
                         _property_row("dofadr", int(model.jnt_dofadr[joint_id]))
                         if model.jnt_limited[joint_id]:
                             _property_row("range", _vector(model.jnt_range[joint_id]))
-                        imgui.end_table()
+                        _end_properties()
+                    imgui.unindent()
+            imgui.unindent()
+
+    def _draw_xml_popup(self):
+        if not self.xml_popup_open:
+            return
+        imgui.set_next_window_size(
+            imgui.ImVec2(1100, 750), imgui.Cond_.first_use_ever
+        )
+        expanded, opened = imgui.begin(
+            f"XML 源码 - {self.xml_name}##xml_popup",
+            True,
+            imgui.WindowFlags_.no_collapse,
+        )
+        self.xml_popup_open = opened
+        try:
+            if expanded:
+                if imgui.button("返回右侧面板"):
+                    self.xml_popup_open = False
+                self._draw_xml_editor()
+        finally:
+            imgui.end()
+
+    def _draw_xml_search(self):
+        imgui.set_next_item_width(-1)
+        changed, query = imgui.input_text_with_hint(
+            "##xml_search", "搜索当前 XML", self.xml_search_text
+        )
+        if changed:
+            self.xml_search_text = query
+            self.xml_search_matches = []
+            if query:
+                for line_number, line in enumerate(self.xml_lines, 1):
+                    start = line.find(query)
+                    while start >= 0:
+                        self.xml_search_matches.append(
+                            (line_number, start, start + len(query))
+                        )
+                        start = line.find(query, start + len(query))
+            self.xml_search_index = 0 if self.xml_search_matches else -1
+            if self.xml_search_matches:
+                self.xml_scroll_line = self.xml_search_matches[0][0]
+
+        imgui.begin_disabled(not self.xml_search_matches)
+        try:
+            if imgui.button("上一个##xml_search"):
+                self.xml_search_index = (
+                    self.xml_search_index - 1
+                ) % len(self.xml_search_matches)
+                self.xml_scroll_line = self.xml_search_matches[self.xml_search_index][0]
+            imgui.same_line()
+            if imgui.button("下一个##xml_search"):
+                self.xml_search_index = (
+                    self.xml_search_index + 1
+                ) % len(self.xml_search_matches)
+                self.xml_scroll_line = self.xml_search_matches[self.xml_search_index][0]
+        finally:
+            imgui.end_disabled()
+
+        if self.xml_search_matches:
+            imgui.text_disabled(
+                f"第 {self.xml_search_index + 1}/{len(self.xml_search_matches)} 处"
+                f" · 行 {self.xml_search_matches[self.xml_search_index][0]}"
+            )
+        elif self.xml_search_text:
+            imgui.text_disabled("无匹配")
+        else:
+            imgui.text_disabled("输入关键字查找当前 XML")
+
+    def _draw_xml_search_highlights(self, origin, editor_size, line_height):
+        if not self.xml_search_matches:
+            return
+        draw_list = imgui.get_foreground_draw_list()
+        padding = imgui.get_style().frame_padding
+        scroll_y = imgui.get_scroll_y()
+        first_line = max(1, int(scroll_y // line_height))
+        last_line = min(
+            len(self.xml_lines), int((scroll_y + editor_size.y) // line_height) + 2
+        )
+        normal_color = imgui.get_color_u32(imgui.ImVec4(1.0, 0.85, 0.1, 0.25))
+        current_color = imgui.get_color_u32(imgui.ImVec4(1.0, 0.35, 0.1, 0.38))
+        draw_list.push_clip_rect(
+            origin,
+            imgui.ImVec2(origin.x + editor_size.x, origin.y + editor_size.y),
+            True,
+        )
+        try:
+            for match_index, (line_number, start, end) in enumerate(
+                self.xml_search_matches
+            ):
+                if line_number < first_line or line_number > last_line:
+                    continue
+                line = self.xml_lines[line_number - 1]
+                x0 = origin.x + padding.x + imgui.calc_text_size(line[:start]).x
+                match_width = imgui.calc_text_size(line[start:end]).x
+                y0 = origin.y + padding.y + (line_number - 1) * line_height
+                color = (
+                    current_color
+                    if match_index == self.xml_search_index
+                    else normal_color
+                )
+                draw_list.add_rect_filled(
+                    imgui.ImVec2(x0, y0),
+                    imgui.ImVec2(x0 + max(match_width, 4.0), y0 + line_height),
+                    color,
+                )
+        finally:
+            draw_list.pop_clip_rect()
+
+    def _draw_xml_editor(self):
+        if not self.xml_text:
+            imgui.text_wrapped("尚未加载 XML 文件")
+            return
+        imgui.text_disabled(f"{self.xml_name} · 只读，可选择并复制")
+        self._draw_xml_search()
+        imgui.begin_child(
+            "xml_source_scroll",
+            imgui.ImVec2(0, 0),
+            0,
+            imgui.WindowFlags_.horizontal_scrollbar,
+        )
+        try:
+            if self.xml_content_width is None:
+                self.xml_content_width = max(
+                    (imgui.calc_text_size(line).x for line in self.xml_lines),
+                    default=0.0,
+                )
+            editor_size = imgui.get_content_region_avail()
+            available_height = editor_size.y
+            line_height = imgui.get_text_line_height()
+            editor_size.x = max(editor_size.x, self.xml_content_width + 24.0)
+            editor_size.y = max(
+                available_height, max(len(self.xml_lines), 1) * line_height + 24.0
+            )
+            if self.xml_scroll_line is not None:
+                target_y = (self.xml_scroll_line - 1) * line_height
+                imgui.set_scroll_y(max(0.0, target_y - available_height * 0.35))
+                self.xml_scroll_line = None
+            editor_origin = imgui.get_cursor_screen_pos()
+            imgui.input_text_multiline(
+                "##xml_source",
+                self.xml_text,
+                editor_size,
+                imgui.InputTextFlags_.read_only
+                | imgui.InputTextFlags_.no_horizontal_scroll,
+            )
+            self._draw_xml_search_highlights(editor_origin, editor_size, line_height)
+        finally:
+            imgui.end_child()
+
+    def _draw_environment(self, environment_preset):
+        imgui.separator_text("场景预设")
+        presets = [
+            ("blue", "蓝灰地面 / 浅蓝天空"),
+            ("black", "黑色背景"),
+        ]
+        labels = [label for _preset, label in presets]
+        current_index = next(
+            (
+                index
+                for index, (preset, _label) in enumerate(presets)
+                if preset == environment_preset
+            ),
+            0,
+        )
+        imgui.set_next_item_width(-1)
+        changed, selected_index = imgui.combo("##场景预设", current_index, labels)
+        if changed:
+            return presets[selected_index][0]
+        return environment_preset
 
     def _draw_visual_flags(self):
         imgui.separator_text("诊断显示")
@@ -475,9 +826,11 @@ class InspectorUI:
             opened = imgui.tree_node_ex(label, flags)
         finally:
             imgui.pop_style_color()
+        _copy_name_popup(self.index.body_name(body_id))
         if imgui.is_item_clicked() and not imgui.is_item_toggled_open():
             selection.body_id = body_id
             selection.geom_id = -1
+            selection.joint_id = -1
             self.focus_body = body_id
         if self.scroll_body == body_id:
             imgui.set_scroll_here_y(0.5)
@@ -494,23 +847,29 @@ class InspectorUI:
                         )
                     finally:
                         imgui.pop_style_color()
+                    _copy_name_popup(self.index.geom_name(geom_id))
                     if clicked:
                         selection.body_id = body_id
                         selection.geom_id = geom_id
+                        selection.joint_id = -1
                 for joint_id in joint_ids:
                     imgui.push_style_color(
                         imgui.Col_.text, (1.0, 0.75, 0.3, 1.0)
                     )
                     try:
-                        _selected, clicked = imgui.selectable(
+                        _selected, _clicked = imgui.selectable(
                             f"J  {self.index.joint_name(joint_id)}##outline_joint{joint_id}",
-                            False,
+                            selection.joint_id == joint_id,
                         )
                     finally:
                         imgui.pop_style_color()
-                    if clicked:
+                    _copy_name_popup(self.index.joint_name(joint_id))
+                    if imgui.is_item_clicked():
                         selection.body_id = body_id
                         selection.geom_id = -1
+                        selection.joint_id = joint_id
+                        self.option.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = 1
+                        self.focus_body = body_id
                 for child_id in children:
                     self._draw_body_node(child_id, selection)
             finally:

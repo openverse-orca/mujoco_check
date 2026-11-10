@@ -8,6 +8,7 @@ import numpy as np
 class Selection:
     body_id: int = -1
     geom_id: int = -1
+    joint_id: int = -1
 
     @property
     def valid(self):
@@ -82,6 +83,14 @@ def body_focus(model, data, model_index, body_id):
         for geom_id in geom_ids
     )
     return center, max(float(radius), 1e-6)
+
+
+def joint_focus(model, data, joint_id):
+    center = data.xanchor[joint_id].copy()
+    extent = float(model.stat.extent)
+    visual_radius = float(model.vis.scale.jointwidth) * 8.0
+    radius = max(min(visual_radius, extent * 0.05), 1e-6)
+    return center, radius
 
 
 def project_to_window(point, scene, framebuffer_size, window_size):
@@ -171,17 +180,40 @@ def pick_geom(
 def apply_highlight(scene, selection, model_index):
     if not selection.valid:
         return
+    if selection.joint_id >= 0:
+        for index in range(scene.ngeom):
+            geom = scene.geoms[index]
+            if (
+                geom.objtype == mujoco.mjtObj.mjOBJ_JOINT
+                and int(geom.objid) == selection.joint_id
+            ):
+                alpha = geom.rgba[3]
+                geom.rgba[:] = (1.0, 0.75, 0.1, alpha)
+                geom.emission = 0.65
+        return
+    descendant_targets = set()
     if selection.geom_id >= 0:
         targets = {selection.geom_id}
     else:
         targets = set(model_index.body_geoms(selection.body_id))
-    if not targets:
+        pending = list(model_index.children[selection.body_id])
+        while pending:
+            body_id = pending.pop()
+            descendant_targets.update(model_index.body_geoms(body_id))
+            pending.extend(model_index.children[body_id])
+    if not targets and not descendant_targets:
         return
 
+    highlight_color = np.array([1.0, 0.75, 0.1])
     for index in range(scene.ngeom):
         geom = scene.geoms[index]
-        if geom.objtype != mujoco.mjtObj.mjOBJ_GEOM or int(geom.objid) not in targets:
+        if geom.objtype != mujoco.mjtObj.mjOBJ_GEOM:
             continue
-        alpha = geom.rgba[3]
-        geom.rgba[:] = (1.0, 0.75, 0.1, alpha)
-        geom.emission = 0.65
+        geom_id = int(geom.objid)
+        if geom_id in targets:
+            alpha = geom.rgba[3]
+            geom.rgba[:] = (1.0, 0.75, 0.1, alpha)
+            geom.emission = 0.65
+        elif geom_id in descendant_targets:
+            geom.rgba[:3] = 0.65 * geom.rgba[:3] + 0.35 * highlight_color
+            geom.emission = max(float(geom.emission), 0.18)
