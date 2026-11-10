@@ -1,4 +1,5 @@
 import asyncio
+import queue
 import tempfile
 import threading
 import unittest
@@ -12,6 +13,7 @@ from model_sources import (
     download_orca_xml,
     fetch_orca_xml,
     poll_orca_states,
+    stream_orca_states,
 )
 
 
@@ -156,6 +158,90 @@ class PollOrcaStatesTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError) as caught:
             await poll_orca_states(
                 "localhost:50051", lambda _state: None, threading.Event()
+            )
+
+        self.assertIs(caught.exception, error)
+        channel.close.assert_awaited_once_with()
+
+
+class StreamOrcaStatesTests(unittest.IsolatedAsyncioTestCase):
+    @patch("model_sources.OrcaGymLocal")
+    @patch("model_sources.OrcaGymRemote")
+    @patch("model_sources.GrpcServiceStub")
+    @patch("model_sources.grpc.aio.insecure_channel")
+    async def test_stream_pauses_once_and_pushes_visual_state(
+        self, insecure_channel, stub_class, gym_class, visual_gym_class
+    ):
+        channel = insecure_channel.return_value
+        channel.close = AsyncMock()
+        gym = gym_class.return_value
+        visual_gym = visual_gym_class.return_value
+        events = []
+        gym.pause_simulation = AsyncMock(side_effect=lambda: events.append("pause"))
+        gym.set_qpos = AsyncMock()
+        gym.set_qvel = AsyncMock()
+        gym.mj_forward = AsyncMock()
+        visual_gym.push_visual_state = AsyncMock(
+            side_effect=lambda qpos, time: events.append(("visual", qpos, time))
+        )
+        qpos = np.array([1.0, 2.0])
+        state_queue = queue.Queue()
+        state_queue.put((7, qpos, 1.25))
+        stop_event = threading.Event()
+        pushed = []
+
+        def on_pushed(request_id):
+            pushed.append(request_id)
+            stop_event.set()
+
+        await stream_orca_states(
+            "localhost:50051",
+            state_queue,
+            stop_event,
+            on_pushed,
+            timeout=3.5,
+        )
+
+        self.assertEqual(events[0], "pause")
+        self.assertEqual(events[1][0], "visual")
+        self.assertIs(events[1][1], qpos)
+        self.assertEqual(events[1][2], 1.25)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(pushed, [7])
+        gym.pause_simulation.assert_awaited_once_with()
+        gym.set_qpos.assert_not_awaited()
+        gym.set_qvel.assert_not_awaited()
+        gym.mj_forward.assert_not_awaited()
+        insecure_channel.assert_called_once_with(
+            "localhost:50051",
+            options=(("grpc.max_receive_message_length", 64 * 1024 * 1024),),
+        )
+        gym_class.assert_called_once_with(stub_class.return_value)
+        visual_gym_class.assert_called_once_with(stub_class.return_value)
+        channel.close.assert_awaited_once_with()
+
+    @patch("model_sources.OrcaGymLocal")
+    @patch("model_sources.OrcaGymRemote")
+    @patch("model_sources.GrpcServiceStub")
+    @patch("model_sources.grpc.aio.insecure_channel")
+    async def test_stream_error_propagates_and_closes_channel(
+        self, insecure_channel, _stub_class, gym_class, visual_gym_class
+    ):
+        channel = insecure_channel.return_value
+        channel.close = AsyncMock()
+        gym = gym_class.return_value
+        error = RuntimeError("push failed")
+        gym.pause_simulation = AsyncMock()
+        visual_gym_class.return_value.push_visual_state = AsyncMock(side_effect=error)
+        state_queue = queue.Queue()
+        state_queue.put((7, np.zeros(2), 1.25))
+
+        with self.assertRaises(RuntimeError) as caught:
+            await stream_orca_states(
+                "localhost:50051",
+                state_queue,
+                threading.Event(),
+                lambda _request_id: None,
             )
 
         self.assertIs(caught.exception, error)

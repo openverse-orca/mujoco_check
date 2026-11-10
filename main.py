@@ -21,7 +21,12 @@ from inspection import (
     pick_geom,
 )
 from inspector_ui import APP_NAME, InspectorUI
-from model_sources import cleanup_orca_fetch, fetch_orca_xml, poll_orca_states
+from model_sources import (
+    cleanup_orca_fetch,
+    fetch_orca_xml,
+    poll_orca_states,
+    stream_orca_states,
+)
 
 
 ZOOM_SPEED = 0.18
@@ -41,7 +46,15 @@ ENVIRONMENT_BACKGROUNDS = {
 }
 
 
-def window_resize_edges(width, height, x, y, margin=6):
+def window_resize_edges(width, height, x, y, margin=6, corner_margin=24):
+    if x < corner_margin and y < corner_margin:
+        return "left", "top"
+    if x >= width - corner_margin and y < corner_margin:
+        return "right", "top"
+    if x < corner_margin and y >= height - corner_margin:
+        return "left", "bottom"
+    if x >= width - corner_margin and y >= height - corner_margin:
+        return "right", "bottom"
     edges = []
     if x < margin:
         edges.append("left")
@@ -210,6 +223,27 @@ def keyboard_move_camera(
     cam.lookat[:] += movement / length * units_per_second * frame_time
 
 
+def interaction_force(cam, drag, viewport_height, fovy, extent, strength):
+    if viewport_height <= 0:
+        return np.zeros(3)
+    azimuth = math.radians(cam.azimuth)
+    elevation = math.radians(cam.elevation)
+    right = np.array([-math.sin(azimuth), math.cos(azimuth), 0.0])
+    up = np.array(
+        [
+            -math.sin(elevation) * math.cos(azimuth),
+            -math.sin(elevation) * math.sin(azimuth),
+            math.cos(elevation),
+        ]
+    )
+    units_per_pixel = (
+        2.0 * cam.distance * math.tan(math.radians(fovy) * 0.5) / viewport_height
+    )
+    units_per_pixel *= close_step_scale(cam.distance, extent)
+    dx, dy = drag
+    return (right * dx - up * dy) * units_per_pixel * float(strength)
+
+
 def draw_environment_background(color):
     GL.glPushAttrib(
         GL.GL_ENABLE_BIT
@@ -291,6 +325,10 @@ class Viewer:
         self.inspector = None
 
         self.running = False
+        self.interaction_enabled = False
+        self.force_strength = 20.0
+        self.force_body_id = -1
+        self.force_vector = np.zeros(3)
         self.accumulator = 0.0
         self.last_time = time.perf_counter()
         self.buttons = set()
@@ -309,6 +347,13 @@ class Viewer:
         self.orca_sync_stop = None
         self.orca_sync_enabled = False
         self.orca_sync_connected = False
+        self.orca_push_results = queue.SimpleQueue()
+        self.orca_push_request_id = 0
+        self.orca_push_busy = False
+        self.orca_push_connected = False
+        self.orca_push_stop = None
+        self.orca_push_states = None
+        self.orca_push_address = ""
         self.shutting_down = threading.Event()
 
     @property
@@ -342,6 +387,9 @@ class Viewer:
             raise
 
         self.stop_orca_sync()
+        self.stop_orca_push()
+        self._clear_external_force()
+        self.interaction_enabled = False
         old_context = self.context
         self.xml_path = path
         self.xml_text = xml_text
@@ -360,6 +408,10 @@ class Viewer:
         self.last_time = time.perf_counter()
         self._on_focus(None, False)
         if self.inspector is not None:
+            self.inspector.mode = "view"
+            self.inspector.orca_sync_enabled = False
+            self.inspector.orca_push_busy = False
+            self.inspector.local_running = False
             self.inspector.rebind_model(
                 model, data, model_index, self.model_name, self.xml_text
             )
@@ -432,17 +484,222 @@ class Viewer:
             finally:
                 cleanup_orca_fetch(cache_dir)
 
-    def set_orca_sync(self, enabled, address):
-        if enabled:
+    def _clear_external_force(self):
+        if self.force_body_id >= 0:
+            self.data.xfrc_applied[self.force_body_id] = 0.0
+        self.force_body_id = -1
+        self.force_vector = np.zeros(3)
+
+    def set_mode(self, mode, address):
+        if mode != "interaction":
+            self.stop_orca_push()
+        if mode == "sync":
+            self.interaction_enabled = False
+            self.running = False
+            self.accumulator = 0.0
+            self._clear_external_force()
             self.start_orca_sync(address)
+            return
+
+        self.stop_orca_sync()
+        self._clear_external_force()
+        self.interaction_enabled = mode == "interaction"
+        self.running = self.interaction_enabled
+        self.accumulator = 0.0
+        if self.inspector is not None:
+            self.inspector.mode = "interaction" if self.interaction_enabled else "view"
+            self.inspector.orca_sync_enabled = False
+            self.inspector.local_running = self.running
+        self._set_source_status(
+            "本地主仿真（推送）"
+            if self.interaction_enabled
+            else "模型查看模式"
+        )
+        if self.interaction_enabled:
+            self.push_local_state(address)
+
+    def set_orca_sync(self, enabled, address):
+        self.set_mode("sync" if enabled else "view", address)
+
+    def toggle_interaction_running(self):
+        if self.interaction_enabled:
+            self.running = not self.running
+            self.accumulator = 0.0
+
+    def step_interaction(self):
+        if self.interaction_enabled and not self.running:
+            mujoco.mj_step(self.model, self.data)
+
+    def reset_interaction(self):
+        if not self.interaction_enabled:
+            return
+        self._clear_external_force()
+        mujoco.mj_resetData(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
+        self.accumulator = 0.0
+
+    def set_joint_qpos(self, joint_id, values):
+        if not self.interaction_enabled or not 0 <= joint_id < self.model.njnt:
+            return False
+        joint_type = int(self.model.jnt_type[joint_id])
+        sizes = {
+            int(mujoco.mjtJoint.mjJNT_FREE): 7,
+            int(mujoco.mjtJoint.mjJNT_BALL): 4,
+            int(mujoco.mjtJoint.mjJNT_HINGE): 1,
+            int(mujoco.mjtJoint.mjJNT_SLIDE): 1,
+        }
+        size = sizes.get(joint_type)
+        values = np.asarray(values, dtype=float)
+        if size is None or values.shape != (size,) or not np.all(np.isfinite(values)):
+            self._set_source_status("关节状态值无效", True)
+            return False
+        if joint_type in (int(mujoco.mjtJoint.mjJNT_FREE), int(mujoco.mjtJoint.mjJNT_BALL)):
+            quaternion = values[-4:]
+            norm = float(np.linalg.norm(quaternion))
+            if norm <= np.finfo(float).eps:
+                self._set_source_status("关节四元数不能为零", True)
+                return False
+            values = values.copy()
+            values[-4:] = quaternion / norm
+
+        self.running = False
+        self.accumulator = 0.0
+        address = int(self.model.jnt_qposadr[joint_id])
+        self.data.qpos[address : address + size] = values
+        velocity_address = int(self.model.jnt_dofadr[joint_id])
+        if joint_type == int(mujoco.mjtJoint.mjJNT_FREE):
+            velocity_size = 6
+        elif joint_type == int(mujoco.mjtJoint.mjJNT_BALL):
+            velocity_size = 3
         else:
-            self.stop_orca_sync(notify=True)
+            velocity_size = 1
+        self.data.qvel[velocity_address : velocity_address + velocity_size] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+        return True
+
+    def stop_orca_push(self):
+        self.orca_push_request_id += 1
+        self.orca_push_busy = False
+        self.orca_push_connected = False
+        self.orca_push_address = ""
+        if self.orca_push_stop is not None:
+            self.orca_push_stop.set()
+            self.orca_push_stop = None
+        state_queue = self.orca_push_states
+        self.orca_push_states = None
+        if state_queue is not None:
+            while True:
+                try:
+                    state_queue.get_nowait()
+                except queue.Empty:
+                    break
+        if self.inspector is not None:
+            self.inspector.orca_push_busy = False
+
+    def _queue_orca_push_state(self):
+        state_queue = self.orca_push_states
+        if state_queue is None:
+            return
+        result = (
+            self.orca_push_request_id,
+            self.data.qpos.copy(),
+            float(self.data.time),
+        )
+        while True:
+            try:
+                state_queue.put_nowait(result)
+                return
+            except queue.Full:
+                try:
+                    state_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def push_local_state(self, address):
+        address = address.strip()
+        if not self.interaction_enabled:
+            return
+        if not address:
+            self._set_source_status("OrcaLab 地址不能为空", True)
+            return
+        if self.xml_path is None:
+            self._set_source_status("请先加载与 OrcaLab 对应的 XML", True)
+            return
+        if self.orca_push_stop is not None:
+            if address == self.orca_push_address:
+                self._queue_orca_push_state()
+                return
+            self.stop_orca_push()
+
+        self.orca_push_request_id += 1
+        request_id = self.orca_push_request_id
+        stop_event = threading.Event()
+        state_queue = queue.Queue(maxsize=1)
+        self.orca_push_stop = stop_event
+        self.orca_push_states = state_queue
+        self.orca_push_address = address
+        self.orca_push_busy = True
+        self.orca_push_connected = False
+        if self.inspector is not None:
+            self.inspector.orca_push_busy = True
+        self._queue_orca_push_state()
+        self._set_source_status(f"正在连接 OrcaLab 实时同步：{address}")
+        threading.Thread(
+            target=self._orca_push_worker,
+            args=(request_id, address, state_queue, stop_event),
+            daemon=True,
+        ).start()
+
+    def _orca_push_worker(self, request_id, address, state_queue, stop_event):
+        try:
+            asyncio.run(
+                stream_orca_states(
+                    address,
+                    state_queue,
+                    stop_event,
+                    lambda pushed_id: self.orca_push_results.put((pushed_id, None)),
+                )
+            )
+            error = None
+        except Exception as exception:
+            error = str(exception)
+        if (
+            error is not None
+            and not stop_event.is_set()
+            and not self.shutting_down.is_set()
+        ):
+            self.orca_push_results.put((request_id, error))
+
+    def _process_orca_push_results(self):
+        while True:
+            try:
+                request_id, error = self.orca_push_results.get_nowait()
+            except queue.Empty:
+                break
+            if request_id != self.orca_push_request_id:
+                continue
+            self.orca_push_busy = False
+            if self.inspector is not None:
+                self.inspector.orca_push_busy = False
+            if error is not None:
+                self.orca_push_connected = False
+                self.orca_push_address = ""
+                self.orca_push_states = None
+                if self.orca_push_stop is not None:
+                    self.orca_push_stop.set()
+                    self.orca_push_stop = None
+                self._set_source_status(f"OrcaLab 实时同步失败：{error}", True)
+            elif not self.orca_push_connected:
+                self.orca_push_connected = True
+                self._set_source_status("本地主仿真（正在推送到 OrcaLab）")
 
     def start_orca_sync(self, address):
         address = address.strip()
         if not address or self.xml_path is None or self.orca_loading:
             if self.inspector is not None:
                 self.inspector.orca_sync_enabled = False
+                self.inspector.mode = "view"
+                self.inspector.local_running = False
             if not address:
                 self._set_source_status("OrcaLab 地址不能为空", True)
             elif self.xml_path is None:
@@ -452,6 +709,8 @@ class Viewer:
             return
 
         self.stop_orca_sync()
+        self.interaction_enabled = False
+        self._clear_external_force()
         self.running = False
         self.accumulator = 0.0
         self.orca_sync_request_id += 1
@@ -461,7 +720,9 @@ class Viewer:
         self.orca_sync_enabled = True
         if self.inspector is not None:
             self.inspector.orca_sync_enabled = True
-        self._set_source_status(f"正在连接 OrcaLab 同步：{address}")
+            self.inspector.mode = "sync"
+            self.inspector.local_running = False
+        self._set_source_status(f"正在连接 OrcaLab 主仿真（拉取）：{address}")
         threading.Thread(
             target=self._orca_sync_worker,
             args=(request_id, address, stop_event),
@@ -478,8 +739,10 @@ class Viewer:
             self.orca_sync_stop = None
         if self.inspector is not None:
             self.inspector.orca_sync_enabled = False
+            if getattr(self.inspector, "mode", None) == "sync":
+                self.inspector.mode = "view"
         if notify and was_enabled:
-            self._set_source_status("已停止 OrcaLab 同步，当前为查看模式")
+            self._set_source_status("已停止拉取 OrcaLab 状态，当前为模型查看模式")
 
     def _queue_orca_sync_result(self, result):
         while True:
@@ -543,7 +806,7 @@ class Viewer:
 
             if not self.orca_sync_connected:
                 self.orca_sync_connected = True
-                self._set_source_status("正在同步 OrcaLab 仿真")
+                self._set_source_status("OrcaLab 主仿真（正在拉取状态）")
 
     def _aspect_ratio(self):
         if self.window is None:
@@ -597,6 +860,20 @@ class Viewer:
             if button == glfw.MOUSE_BUTTON_LEFT:
                 self.left_press_origin = self.last_cursor
                 self.left_dragging = False
+                if self.interaction_enabled and self.scene is not None:
+                    picked = pick_geom(
+                        self.model,
+                        self.data,
+                        self.option,
+                        self.scene,
+                        self.last_cursor,
+                        glfw.get_window_size(window),
+                        glfw.get_framebuffer_size(window),
+                    )
+                    if picked.body_id > 0:
+                        self.force_body_id = picked.body_id
+                        self.selection = picked
+                        self.inspector.reveal_body(picked.body_id)
         elif action == glfw.RELEASE:
             was_active = button in self.buttons
             self.buttons.discard(button)
@@ -611,6 +888,7 @@ class Viewer:
             ):
                 self.pending_pick = cursor
             if button == glfw.MOUSE_BUTTON_LEFT:
+                self._clear_external_force()
                 self.left_press_origin = None
                 self.left_dragging = False
             self.last_cursor = cursor if self.buttons else None
@@ -668,7 +946,17 @@ class Viewer:
         if glfw.MOUSE_BUTTON_LEFT in self.buttons:
             if not self.left_dragging and not is_click(self.left_press_origin, (x, y)):
                 self.left_dragging = True
-            if self.left_dragging:
+            if self.left_dragging and self.force_body_id > 0:
+                self.force_vector = interaction_force(
+                    self.camera,
+                    (x - self.left_press_origin[0], y - self.left_press_origin[1]),
+                    glfw.get_window_size(window)[1],
+                    self.model.vis.global_.fovy,
+                    self.extent,
+                    self.force_strength,
+                )
+                self.data.xfrc_applied[self.force_body_id, :3] = self.force_vector
+            elif self.left_dragging:
                 orbit_camera(self.camera, dx, dy)
         else:
             _width, height = glfw.get_window_size(self.window)
@@ -689,6 +977,7 @@ class Viewer:
 
     def _on_focus(self, _window, focused):
         if not focused:
+            self._clear_external_force()
             self.buttons.clear()
             self.movement_keys.clear()
             self.last_cursor = None
@@ -722,20 +1011,13 @@ class Viewer:
             return
         if key == glfw.KEY_ESCAPE:
             glfw.set_window_should_close(window, True)
-        elif key == glfw.KEY_SPACE and not self.orca_sync_enabled:
-            self.running = not self.running
-            self.accumulator = 0.0
+        elif key == glfw.KEY_SPACE and self.interaction_enabled:
+            self.toggle_interaction_running()
             self._update_title()
-        elif (
-            key == glfw.KEY_PERIOD
-            and not self.running
-            and not self.orca_sync_enabled
-        ):
-            mujoco.mj_step(self.model, self.data)
-        elif key == glfw.KEY_R and not self.orca_sync_enabled:
-            mujoco.mj_resetData(self.model, self.data)
-            mujoco.mj_forward(self.model, self.data)
-            self.accumulator = 0.0
+        elif key == glfw.KEY_PERIOD and self.interaction_enabled:
+            self.step_interaction()
+        elif key == glfw.KEY_R and self.interaction_enabled:
+            self.reset_interaction()
         elif key == glfw.KEY_HOME:
             self._reset_camera()
 
@@ -762,7 +1044,13 @@ class Viewer:
                 self.extent,
                 self.pan_speed,
             )
-        if not self.running or self.orca_sync_enabled:
+        if self.interaction_enabled:
+            self._queue_orca_push_state()
+        if (
+            not self.running
+            or not self.interaction_enabled
+            or self.orca_sync_enabled
+        ):
             return
 
         self.accumulator += frame_time
@@ -774,6 +1062,7 @@ class Viewer:
             steps += 1
         if steps == 20:
             self.accumulator = 0.0
+        self._queue_orca_push_state()
 
     def _render(self):
         width, height = glfw.get_framebuffer_size(self.window)
@@ -781,6 +1070,8 @@ class Viewer:
             return
 
         self.inspector.begin_frame()
+        self.inspector.local_running = self.running
+        self.inspector.force_strength = self.force_strength
         previous_zoom_speed = self.zoom_speed
         (
             self.selection,
@@ -795,6 +1086,7 @@ class Viewer:
             self.environment_preset,
             self.near_clip_ratio,
         )
+        self.force_strength = self.inspector.force_strength
         if self.zoom_speed != previous_zoom_speed:
             self._update_title()
         focus_body = self.inspector.consume_focus_request()
@@ -890,6 +1182,12 @@ class Viewer:
             self.inspector.on_open_xml = self.load_local_xml
             self.inspector.on_orca_pull = self.start_orca_fetch
             self.inspector.on_orca_sync = self.set_orca_sync
+            self.inspector.on_mode_change = self.set_mode
+            self.inspector.on_joint_set = self.set_joint_qpos
+            self.inspector.on_toggle_running = self.toggle_interaction_running
+            self.inspector.on_single_step = self.step_interaction
+            self.inspector.on_reset_simulation = self.reset_interaction
+            self.inspector.on_push_state = self.push_local_state
             self.inspector.rebind_model(
                 self.model,
                 self.data,
@@ -925,6 +1223,7 @@ class Viewer:
                 glfw.poll_events()
                 self._process_orca_results()
                 self._process_orca_sync_results()
+                self._process_orca_push_results()
                 self._step_simulation()
                 width, height = glfw.get_framebuffer_size(self.window)
                 if width <= 0 or height <= 0:
@@ -934,7 +1233,9 @@ class Viewer:
         finally:
             self.shutting_down.set()
             self.stop_orca_sync()
+            self._clear_external_force()
             self.orca_request_id += 1
+            self.stop_orca_push()
             self._process_orca_results()
             if self.inspector is not None:
                 self.inspector.shutdown()

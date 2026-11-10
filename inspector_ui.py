@@ -90,6 +90,17 @@ class InspectorUI:
         self.on_open_xml = None
         self.on_orca_pull = None
         self.on_orca_sync = None
+        self.on_mode_change = None
+        self.on_joint_set = None
+        self.on_toggle_running = None
+        self.on_single_step = None
+        self.on_reset_simulation = None
+        self.on_push_state = None
+        self.mode = "view"
+        self.local_running = False
+        self.force_strength = 20.0
+        self.interaction_joint_id = 0
+        self.orca_push_busy = False
         self.orca_address = "localhost:50051"
         self.orca_busy = False
         self.orca_sync_enabled = False
@@ -193,15 +204,21 @@ class InspectorUI:
         if imgui.button("拉取 XML") and self.on_orca_pull is not None:
             self.on_orca_pull(self.orca_address)
         imgui.end_disabled()
-        imgui.begin_disabled(self.orca_busy or not self.xml_text)
-        sync_changed, sync_enabled = imgui.checkbox(
-            "同步 OrcaLab 仿真", self.orca_sync_enabled
-        )
-        if sync_changed:
-            self.orca_sync_enabled = sync_enabled
-            if self.on_orca_sync is not None:
-                self.on_orca_sync(sync_enabled, self.orca_address)
-        imgui.end_disabled()
+        imgui.separator_text("运行模式")
+        for mode, label in (
+            ("view", "模型查看"),
+            ("sync", "OrcaLab 主仿真（拉取）"),
+            ("interaction", "本地主仿真（推送）"),
+        ):
+            imgui.begin_disabled(
+                mode != "view" and (self.orca_busy or not self.xml_text)
+            )
+            if imgui.radio_button(label, self.mode == mode):
+                self.mode = mode
+                self.orca_sync_enabled = mode == "sync"
+                if self.on_mode_change is not None:
+                    self.on_mode_change(mode, self.orca_address)
+            imgui.end_disabled()
         if self.source_error:
             imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(1.0, 0.35, 0.3, 1.0))
             imgui.text_wrapped(self.source_status)
@@ -409,6 +426,14 @@ class InspectorUI:
                         imgui.text_disabled("接近场景时自动精细缩放和平移")
                         imgui.end_tab_item()
 
+                    interaction_tab, _open = imgui.begin_tab_item("交互控制")
+                    if interaction_tab:
+                        if self.mode == "interaction":
+                            self._draw_interaction_controls()
+                        else:
+                            imgui.text_wrapped("请先在左侧选择“本地主仿真（推送）”模式")
+                        imgui.end_tab_item()
+
                     xml_tab, _open = imgui.begin_tab_item("XML 源码")
                     if xml_tab:
                         if self.xml_popup_open:
@@ -508,6 +533,128 @@ class InspectorUI:
             imgui.pop_style_var()
             if self.label_font is not None:
                 imgui.pop_font()
+
+    def _draw_interaction_controls(self):
+        imgui.text_wrapped("在视口中按住并拖动 Body 施加外力，松开鼠标立即清零。")
+        imgui.text("外力强度")
+        imgui.set_next_item_width(-1)
+        _changed, self.force_strength = imgui.slider_float(
+            "##外力强度",
+            self.force_strength,
+            0.1,
+            1000.0,
+            "%.1f",
+            imgui.SliderFlags_.logarithmic,
+        )
+
+        if imgui.button("暂停" if self.local_running else "继续"):
+            if self.on_toggle_running is not None:
+                self.on_toggle_running()
+        imgui.same_line()
+        imgui.begin_disabled(self.local_running)
+        if imgui.button("单步") and self.on_single_step is not None:
+            self.on_single_step()
+        imgui.end_disabled()
+        imgui.same_line()
+        if imgui.button("重置") and self.on_reset_simulation is not None:
+            self.on_reset_simulation()
+
+        imgui.begin_disabled(self.orca_push_busy)
+        if imgui.button("立即重发当前状态") and self.on_push_state is not None:
+            self.on_push_state(self.orca_address)
+        imgui.end_disabled()
+        imgui.text_disabled("本地主仿真自动实时推送；连接后 OrcaLab 保持暂停")
+
+        imgui.separator_text("关节状态")
+        if self.model.njnt == 0:
+            imgui.text_disabled("当前模型无 Joint")
+            return
+        self.interaction_joint_id = min(
+            self.interaction_joint_id, self.model.njnt - 1
+        )
+        joint_id = self.interaction_joint_id
+        preview = f"[{joint_id}] {self.index.joint_name(joint_id)}"
+        if imgui.begin_combo("选择 Joint", preview):
+            for candidate in range(self.model.njnt):
+                label = f"[{candidate}] {self.index.joint_name(candidate)}"
+                _selected, clicked = imgui.selectable(
+                    label, candidate == joint_id
+                )
+                if clicked:
+                    self.interaction_joint_id = candidate
+                    joint_id = candidate
+            imgui.end_combo()
+
+        joint_type = int(self.model.jnt_type[joint_id])
+        address = int(self.model.jnt_qposadr[joint_id])
+        extent = max(float(self.model.stat.extent), 1e-3)
+        imgui.push_id(f"interaction_joint_{joint_id}")
+        try:
+            if joint_type in (
+                int(mujoco.mjtJoint.mjJNT_HINGE),
+                int(mujoco.mjtJoint.mjJNT_SLIDE),
+            ):
+                current = float(self.data.qpos[address])
+                if self.model.jnt_limited[joint_id]:
+                    minimum, maximum = (
+                        float(value) for value in self.model.jnt_range[joint_id]
+                    )
+                elif joint_type == int(mujoco.mjtJoint.mjJNT_HINGE):
+                    minimum = min(-3.141592653589793, current)
+                    maximum = max(3.141592653589793, current)
+                else:
+                    minimum = min(-extent, current)
+                    maximum = max(extent, current)
+                imgui.set_next_item_width(-1)
+                changed, value = imgui.slider_float(
+                    "qpos", current, minimum, maximum, "%.6f"
+                )
+                if changed and self.on_joint_set is not None:
+                    if self.on_joint_set(joint_id, [value]) is not False:
+                        self.local_running = False
+                return
+
+            if joint_type == int(mujoco.mjtJoint.mjJNT_BALL):
+                values = [float(value) for value in self.data.qpos[address : address + 4]]
+                labels = ("w", "x", "y", "z")
+                start = 0
+            elif joint_type == int(mujoco.mjtJoint.mjJNT_FREE):
+                values = [float(value) for value in self.data.qpos[address : address + 7]]
+                for index, label in enumerate(("x", "y", "z")):
+                    current = values[index]
+                    imgui.set_next_item_width(-1)
+                    changed, value = imgui.slider_float(
+                        label,
+                        current,
+                        min(-extent, current),
+                        max(extent, current),
+                        "%.6f",
+                    )
+                    if changed:
+                        values[index] = value
+                        if self.on_joint_set is not None:
+                            if self.on_joint_set(joint_id, values) is not False:
+                                self.local_running = False
+                labels = ("qw", "qx", "qy", "qz")
+                start = 3
+            else:
+                imgui.text_disabled("不支持的 Joint 类型")
+                return
+
+            imgui.text("姿态四元数")
+            for index, label in enumerate(labels):
+                value_index = start + index
+                imgui.set_next_item_width(-1)
+                changed, value = imgui.slider_float(
+                    label, values[value_index], -1.0, 1.0, "%.6f"
+                )
+                if changed:
+                    values[value_index] = value
+                    if self.on_joint_set is not None:
+                        if self.on_joint_set(joint_id, values) is not False:
+                            self.local_running = False
+        finally:
+            imgui.pop_id()
 
     def _draw_details(self, selection):
         model = self.model

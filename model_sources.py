@@ -1,4 +1,5 @@
 import asyncio
+import queue
 import shutil
 import tempfile
 from pathlib import Path
@@ -49,6 +50,34 @@ async def poll_orca_states(
                 break
             on_state(state)
             await asyncio.sleep(interval)
+    finally:
+        await channel.close()
+
+
+async def stream_orca_states(
+    address,
+    state_queue,
+    stop_event,
+    on_pushed,
+    interval=1.0 / 60.0,
+    timeout=5.0,
+):
+    channel = grpc.aio.insecure_channel(address, options=ORCA_GRPC_OPTIONS)
+    try:
+        stub = GrpcServiceStub(channel)
+        gym = OrcaGymRemote(stub)
+        visual_gym = OrcaGymLocal(stub)
+        await asyncio.wait_for(gym.pause_simulation(), timeout=timeout)
+        while not stop_event.is_set():
+            try:
+                request_id, qpos, time = state_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(interval)
+                continue
+            await asyncio.wait_for(
+                visual_gym.push_visual_state(qpos, time), timeout=timeout
+            )
+            on_pushed(request_id)
     finally:
         await channel.close()
 

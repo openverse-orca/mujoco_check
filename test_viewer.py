@@ -1,9 +1,11 @@
 import math
+import queue
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import glfw
 import mujoco
@@ -16,6 +18,7 @@ from main import (
     ZOOM_SPEED,
     camera_limits,
     focus_camera,
+    interaction_force,
     is_click,
     keyboard_move_camera,
     orbit_camera,
@@ -217,10 +220,34 @@ class CameraTests(unittest.TestCase):
         )
 
 
+class InteractionForceTests(unittest.TestCase):
+    def setUp(self):
+        self.camera = SimpleNamespace(distance=1.0, azimuth=0.0, elevation=0.0)
+
+    def test_drag_maps_to_camera_right_and_up(self):
+        right = interaction_force(self.camera, (10.0, 0.0), 800.0, 45.0, 1.0, 2.0)
+        up = interaction_force(self.camera, (0.0, -10.0), 800.0, 45.0, 1.0, 2.0)
+        expected_length = 20.0 * math.tan(math.radians(45.0) * 0.5) / 400.0
+
+        np.testing.assert_allclose(right, [0.0, expected_length, 0.0])
+        np.testing.assert_allclose(up, [0.0, 0.0, expected_length])
+
+    def test_zero_height_produces_no_force_and_strength_scales_linearly(self):
+        zero = interaction_force(self.camera, (10.0, 10.0), 0.0, 45.0, 1.0, 2.0)
+        force = interaction_force(self.camera, (10.0, 0.0), 800.0, 45.0, 1.0, 2.0)
+        doubled = interaction_force(self.camera, (10.0, 0.0), 800.0, 45.0, 1.0, 4.0)
+
+        np.testing.assert_array_equal(zero, np.zeros(3))
+        np.testing.assert_allclose(doubled, force * 2.0)
+
+
 class WindowFrameTests(unittest.TestCase):
     def test_resize_edges_include_corners(self):
         self.assertEqual(window_resize_edges(1280, 800, 0, 799), ("left", "bottom"))
         self.assertEqual(window_resize_edges(1280, 800, 1279, 0), ("right", "top"))
+        self.assertEqual(window_resize_edges(1280, 800, 1260, 780), ("right", "bottom"))
+        self.assertEqual(window_resize_edges(1280, 800, 1260, 700), ())
+        self.assertEqual(window_resize_edges(1280, 800, 1279, 700), ("right",))
         self.assertEqual(window_resize_edges(1280, 800, 640, 400), ())
 
     def test_resize_geometry_preserves_minimum_and_opposite_edges(self):
@@ -306,6 +333,293 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(viewer.xml_path, xml_path.resolve())
 
 
+class LocalInteractionTests(unittest.TestCase):
+    def setUp(self):
+        self.xml_path = Path(__file__).with_name("small_scene.xml")
+        self.viewer = Viewer(self.xml_path)
+        self.statuses = []
+        self.viewer.inspector = SimpleNamespace(
+            mode="view",
+            local_running=False,
+            orca_sync_enabled=False,
+            orca_push_busy=False,
+            set_source_status=lambda text, error=False: self.statuses.append(
+                (text, error)
+            ),
+        )
+
+    def test_modes_are_mutually_exclusive(self):
+        with patch("main.threading.Thread") as thread_class:
+            self.viewer.set_mode("interaction", "localhost:50051")
+            self.assertTrue(self.viewer.interaction_enabled)
+            self.assertTrue(self.viewer.running)
+            self.assertFalse(self.viewer.orca_sync_enabled)
+            self.assertEqual(self.viewer.inspector.mode, "interaction")
+            thread_class.return_value.start.assert_called_once_with()
+
+            self.viewer.set_mode("sync", "localhost:50051")
+            self.assertFalse(self.viewer.interaction_enabled)
+            self.assertFalse(self.viewer.running)
+            self.assertTrue(self.viewer.orca_sync_enabled)
+            self.assertEqual(self.viewer.inspector.mode, "sync")
+            self.assertEqual(thread_class.return_value.start.call_count, 2)
+
+            stop_event = self.viewer.orca_sync_stop
+            self.viewer.set_mode("view", "localhost:50051")
+            self.assertFalse(self.viewer.interaction_enabled)
+            self.assertFalse(self.viewer.running)
+            self.assertFalse(self.viewer.orca_sync_enabled)
+            self.assertEqual(self.viewer.inspector.mode, "view")
+            self.assertTrue(stop_event.is_set())
+
+    def test_view_does_not_step_and_interaction_controls_local_simulation(self):
+        self.viewer.inspector = None
+        original_qvel = self.viewer.data.qvel.copy()
+        self.viewer.running = True
+        self.viewer.last_time -= 1.0
+        self.viewer._step_simulation()
+        np.testing.assert_array_equal(self.viewer.data.qvel, original_qvel)
+
+        with patch("main.threading.Thread"):
+            self.viewer.set_mode("interaction", "localhost:50051")
+        self.viewer.toggle_interaction_running()
+        self.assertFalse(self.viewer.running)
+        self.viewer.step_interaction()
+        self.assertGreater(self.viewer.data.time, 0.0)
+
+        self.viewer.reset_interaction()
+        self.assertEqual(self.viewer.data.time, 0.0)
+        np.testing.assert_array_equal(self.viewer.data.qpos, self.viewer.model.qpos0)
+
+    def test_external_force_is_cleared(self):
+        self.viewer.force_body_id = 1
+        self.viewer.force_vector = np.array([1.0, 2.0, 3.0])
+        self.viewer.data.xfrc_applied[1, :3] = self.viewer.force_vector
+
+        self.viewer._clear_external_force()
+
+        np.testing.assert_array_equal(self.viewer.data.xfrc_applied[1], np.zeros(6))
+        self.assertEqual(self.viewer.force_body_id, -1)
+        np.testing.assert_array_equal(self.viewer.force_vector, np.zeros(3))
+
+
+class JointInteractionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        xml_path = Path(self.temporary_directory.name) / "joints.xml"
+        xml_path.write_text(
+            """
+            <mujoco>
+              <worldbody>
+                <body name="hinge_body" pos="0 0 1">
+                  <joint name="hinge" type="hinge" axis="0 0 1"/>
+                  <geom type="sphere" size="0.1"/>
+                </body>
+                <body name="slide_body" pos="1 0 1">
+                  <joint name="slide" type="slide" axis="1 0 0"/>
+                  <geom type="sphere" size="0.1"/>
+                </body>
+                <body name="ball_body" pos="2 0 1">
+                  <joint name="ball" type="ball"/>
+                  <geom type="sphere" size="0.1"/>
+                </body>
+                <body name="free_body" pos="3 0 1">
+                  <freejoint name="free"/>
+                  <geom type="sphere" size="0.1"/>
+                </body>
+              </worldbody>
+            </mujoco>
+            """,
+            encoding="utf-8",
+        )
+        self.viewer = Viewer(xml_path)
+        self.viewer.interaction_enabled = True
+        self.viewer.running = True
+        self.statuses = []
+        self.viewer.inspector = SimpleNamespace(
+            set_source_status=lambda text, error=False: self.statuses.append(
+                (text, error)
+            )
+        )
+
+    def joint_id(self, name):
+        return mujoco.mj_name2id(
+            self.viewer.model, mujoco.mjtObj.mjOBJ_JOINT, name
+        )
+
+    def test_all_joint_types_set_qpos_normalize_quaternions_and_clear_velocity(self):
+        self.viewer.data.qvel[:] = 0.5
+        cases = (
+            ("hinge", [0.4], [0.4]),
+            ("slide", [0.2], [0.2]),
+            ("ball", [2.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]),
+            (
+                "free",
+                [1.0, 2.0, 3.0, 2.0, 0.0, 0.0, 0.0],
+                [1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0],
+            ),
+        )
+        for name, values, expected in cases:
+            with self.subTest(joint=name):
+                joint_id = self.joint_id(name)
+                address = int(self.viewer.model.jnt_qposadr[joint_id])
+                self.assertTrue(self.viewer.set_joint_qpos(joint_id, values))
+                np.testing.assert_allclose(
+                    self.viewer.data.qpos[address : address + len(expected)], expected
+                )
+                self.assertFalse(self.viewer.running)
+        np.testing.assert_array_equal(self.viewer.data.qvel, np.zeros(self.viewer.model.nv))
+
+    def test_invalid_joint_values_are_rejected_without_changing_state(self):
+        original_qpos = self.viewer.data.qpos.copy()
+        self.assertFalse(self.viewer.set_joint_qpos(self.joint_id("hinge"), [1.0, 2.0]))
+        self.assertFalse(self.viewer.set_joint_qpos(self.joint_id("slide"), [math.nan]))
+        self.assertFalse(
+            self.viewer.set_joint_qpos(self.joint_id("ball"), [0.0, 0.0, 0.0, 0.0])
+        )
+        np.testing.assert_array_equal(self.viewer.data.qpos, original_qpos)
+        self.assertTrue(all(error for _text, error in self.statuses))
+
+    def test_joint_setting_requires_interaction_mode(self):
+        self.viewer.interaction_enabled = False
+        self.assertFalse(self.viewer.set_joint_qpos(self.joint_id("hinge"), [0.4]))
+
+
+class OrcaPushTests(unittest.TestCase):
+    def setUp(self):
+        self.xml_path = Path(__file__).with_name("small_scene.xml")
+        self.viewer = Viewer(self.xml_path)
+        self.viewer.interaction_enabled = True
+        self.statuses = []
+        self.viewer.inspector = SimpleNamespace(
+            orca_push_busy=False,
+            set_source_status=lambda text, error=False: self.statuses.append(
+                (text, error)
+            ),
+        )
+
+    def test_push_starts_one_stream_and_keeps_only_latest_snapshot(self):
+        self.viewer.data.qpos[2] = 0.02
+        self.viewer.data.time = 1.25
+        with patch("main.threading.Thread") as thread_class:
+            self.viewer.push_local_state(" localhost:50051 ")
+            self.viewer.data.qpos[2] = 0.04
+            self.viewer.data.time = 2.5
+            self.viewer.push_local_state("localhost:50051")
+
+            thread_class.assert_called_once()
+            arguments = thread_class.call_args.kwargs["args"]
+            self.assertEqual(arguments[0], self.viewer.orca_push_request_id)
+            self.assertEqual(arguments[1], "localhost:50051")
+            self.assertIs(arguments[2], self.viewer.orca_push_states)
+            self.assertIs(arguments[3], self.viewer.orca_push_stop)
+            thread_class.return_value.start.assert_called_once_with()
+
+        request_id, qpos, time = self.viewer.orca_push_states.get_nowait()
+        self.assertEqual(request_id, self.viewer.orca_push_request_id)
+        self.assertEqual(qpos[2], 0.04)
+        self.assertEqual(time, 2.5)
+        self.assertTrue(self.viewer.orca_push_busy)
+        self.assertTrue(self.viewer.inspector.orca_push_busy)
+
+    def test_simulation_loop_automatically_queues_current_state(self):
+        with patch("main.threading.Thread"):
+            self.viewer.push_local_state("localhost:50051")
+        self.viewer.orca_push_states.get_nowait()
+        self.viewer.data.qpos[2] = 0.03
+        self.viewer.data.time = 3.5
+        self.viewer.running = False
+        self.viewer.inspector = None
+
+        self.viewer._step_simulation()
+
+        _request_id, qpos, time = self.viewer.orca_push_states.get_nowait()
+        self.assertEqual(qpos[2], 0.03)
+        self.assertEqual(time, 3.5)
+
+    def test_worker_publishes_success(self):
+        state_queue = queue.Queue(maxsize=1)
+        stop_event = threading.Event()
+        request_id = self.viewer.orca_push_request_id
+        qpos = self.viewer.data.qpos.copy()
+        state_queue.put((request_id, qpos, 1.25))
+
+        async def fake_stream(_address, received_queue, received_stop, on_pushed):
+            pushed_id, _qpos, _time = received_queue.get_nowait()
+            on_pushed(pushed_id)
+            received_stop.set()
+
+        with patch("main.stream_orca_states", new_callable=AsyncMock) as stream:
+            stream.side_effect = fake_stream
+            self.viewer._orca_push_worker(
+                request_id, "localhost:50051", state_queue, stop_event
+            )
+
+        stream.assert_awaited_once()
+        self.assertEqual(self.viewer.orca_push_results.get_nowait(), (request_id, None))
+
+    def test_success_failure_and_stale_results(self):
+        request_id = self.viewer.orca_push_request_id
+        self.viewer.orca_push_busy = True
+        self.viewer.inspector.orca_push_busy = True
+        self.viewer.orca_push_results.put((request_id - 1, None))
+        self.viewer._process_orca_push_results()
+        self.assertTrue(self.viewer.orca_push_busy)
+        self.assertEqual(self.statuses, [])
+
+        self.viewer.orca_push_results.put((request_id, None))
+        self.viewer._process_orca_push_results()
+        self.assertFalse(self.viewer.orca_push_busy)
+        self.assertTrue(self.viewer.orca_push_connected)
+        self.assertFalse(self.viewer.inspector.orca_push_busy)
+        self.assertEqual(
+            self.statuses[-1], ("本地主仿真（正在推送到 OrcaLab）", False)
+        )
+
+        stop_event = threading.Event()
+        self.viewer.orca_push_stop = stop_event
+        self.viewer.orca_push_states = queue.Queue(maxsize=1)
+        self.viewer.orca_push_results.put((request_id, "write failed"))
+        self.viewer._process_orca_push_results()
+        self.assertFalse(self.viewer.orca_push_busy)
+        self.assertFalse(self.viewer.orca_push_connected)
+        self.assertTrue(stop_event.is_set())
+        self.assertIsNone(self.viewer.orca_push_stop)
+        self.assertIsNone(self.viewer.orca_push_states)
+        self.assertEqual(
+            self.statuses[-1], ("OrcaLab 实时同步失败：write failed", True)
+        )
+
+    def test_push_validation_does_not_start_worker(self):
+        with patch("main.threading.Thread") as thread_class:
+            self.viewer.push_local_state("  ")
+            self.viewer.interaction_enabled = False
+            self.viewer.push_local_state("localhost:50051")
+        thread_class.assert_not_called()
+        self.assertFalse(self.viewer.orca_push_busy)
+        self.assertEqual(self.statuses, [("OrcaLab 地址不能为空", True)])
+
+    def test_model_reload_invalidates_and_stops_pending_push(self):
+        self.viewer.inspector = None
+        self.viewer.orca_push_busy = True
+        self.viewer.orca_push_stop = threading.Event()
+        self.viewer.orca_push_states = queue.Queue(maxsize=1)
+        stop_event = self.viewer.orca_push_stop
+        request_id = self.viewer.orca_push_request_id
+
+        self.viewer.load_xml(self.xml_path)
+        self.viewer.orca_push_results.put((request_id, None))
+        self.viewer._process_orca_push_results()
+
+        self.assertGreater(self.viewer.orca_push_request_id, request_id)
+        self.assertTrue(stop_event.is_set())
+        self.assertIsNone(self.viewer.orca_push_stop)
+        self.assertIsNone(self.viewer.orca_push_states)
+        self.assertFalse(self.viewer.orca_push_busy)
+        self.assertFalse(self.viewer.interaction_enabled)
+
+
 class OrcaSyncTests(unittest.TestCase):
     def setUp(self):
         self.xml_path = Path(__file__).with_name("small_scene.xml")
@@ -360,7 +674,7 @@ class OrcaSyncTests(unittest.TestCase):
         np.testing.assert_array_equal(viewer.data.qvel, qvel)
         np.testing.assert_array_equal(viewer.data.xpos[1], qpos[:3])
         self.assertTrue(viewer.orca_sync_connected)
-        self.assertEqual(statuses[-1], ("正在同步 OrcaLab 仿真", False))
+        self.assertEqual(statuses[-1], ("OrcaLab 主仿真（正在拉取状态）", False))
 
     def test_stale_snapshot_is_ignored(self):
         viewer = Viewer(self.xml_path)
