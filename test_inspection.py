@@ -124,6 +124,7 @@ class SelectionTests(unittest.TestCase):
         def select_world(_model, _data, _option, aspect, relx, rely, *_args):
             self.assertEqual(aspect, 2.0)
             self.assertEqual((relx, rely), (0.25, 0.75))
+            _args[1][:] = [1.0, 2.0, 3.0]
             _args[2][0] = 0
             return 0
 
@@ -137,7 +138,9 @@ class SelectionTests(unittest.TestCase):
             (100, 200),
             (400, 200),
         )
-        self.assertEqual(result, Selection(body_id=0, geom_id=0))
+        self.assertEqual(
+            result, Selection(body_id=0, geom_id=0, point=(1.0, 2.0, 3.0))
+        )
 
     @patch("inspection.mujoco.mjv_select")
     def test_invalid_size_and_blank_click_clear_selection(self, select):

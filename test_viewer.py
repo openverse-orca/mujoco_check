@@ -11,14 +11,17 @@ import glfw
 import mujoco
 import numpy as np
 
+from inspection import project_to_window
 from main import (
     Viewer,
     MIN_CLOSE_ZOOM_FACTOR,
     ENVIRONMENT_BACKGROUNDS,
     ZOOM_SPEED,
     camera_limits,
+    draw_interaction_force,
+    draw_interaction_target,
     focus_camera,
-    interaction_force,
+    interaction_drag,
     is_click,
     keyboard_move_camera,
     orbit_camera,
@@ -26,6 +29,7 @@ from main import (
     parse_args,
     reset_camera,
     resized_window_geometry,
+    spring_damper_force,
     window_resize_edges,
     zoom_camera,
 )
@@ -222,23 +226,113 @@ class CameraTests(unittest.TestCase):
 
 class InteractionForceTests(unittest.TestCase):
     def setUp(self):
-        self.camera = SimpleNamespace(distance=1.0, azimuth=0.0, elevation=0.0)
+        self.camera = SimpleNamespace(
+            lookat=np.zeros(3), distance=1.0, azimuth=0.0, elevation=0.0
+        )
 
     def test_drag_maps_to_camera_right_and_up(self):
-        right = interaction_force(self.camera, (10.0, 0.0), 800.0, 45.0, 1.0, 2.0)
-        up = interaction_force(self.camera, (0.0, -10.0), 800.0, 45.0, 1.0, 2.0)
-        expected_length = 20.0 * math.tan(math.radians(45.0) * 0.5) / 400.0
+        right = interaction_drag(self.camera, (10.0, 0.0), 800.0, 45.0, np.zeros(3))
+        up = interaction_drag(self.camera, (0.0, -10.0), 800.0, 45.0, np.zeros(3))
+        expected_length = 10.0 * math.tan(math.radians(45.0) * 0.5) / 400.0
 
-        np.testing.assert_allclose(right, [0.0, expected_length, 0.0])
+        np.testing.assert_allclose(right, [0.0, -expected_length, 0.0])
         np.testing.assert_allclose(up, [0.0, 0.0, expected_length])
 
-    def test_zero_height_produces_no_force_and_strength_scales_linearly(self):
-        zero = interaction_force(self.camera, (10.0, 10.0), 0.0, 45.0, 1.0, 2.0)
-        force = interaction_force(self.camera, (10.0, 0.0), 800.0, 45.0, 1.0, 2.0)
-        doubled = interaction_force(self.camera, (10.0, 0.0), 800.0, 45.0, 1.0, 4.0)
+    def test_drag_target_projects_back_to_mouse_position(self):
+        viewer = Viewer("small_scene.xml")
+        viewer.camera.azimuth = 45.0
+        viewer.camera.elevation = -30.0
+        scene = mujoco.MjvScene(viewer.model, maxgeom=100)
+        mujoco.mjv_updateScene(
+            viewer.model,
+            viewer.data,
+            viewer.option,
+            None,
+            viewer.camera,
+            mujoco.mjtCatBit.mjCAT_ALL,
+            scene,
+        )
+        scene.camera[0].pos = (
+            np.asarray(scene.camera[0].pos) + np.asarray(scene.camera[1].pos)
+        ) * 0.5
+        scene.camera[0].frustum_width = scene.camera[0].frustum_top * 640.0 / 480.0
+        start = viewer.data.xipos[1].copy()
+        cursor = project_to_window(start, scene, (640, 480), (640, 480))
+
+        target = start + interaction_drag(
+            viewer.camera,
+            (100.0, -50.0),
+            480.0,
+            viewer.model.vis.global_.fovy,
+            start,
+        )
+        projected = project_to_window(target, scene, (640, 480), (640, 480))
+
+        np.testing.assert_allclose(
+            projected, (cursor[0] + 100.0, cursor[1] - 50.0), atol=1e-5
+        )
+
+    def test_zero_height_produces_no_drag_and_depth_scales_linearly(self):
+        zero = interaction_drag(self.camera, (10.0, 10.0), 0.0, 45.0, np.zeros(3))
+        drag = interaction_drag(self.camera, (10.0, 0.0), 800.0, 45.0, np.zeros(3))
+        doubled = interaction_drag(
+            self.camera, (10.0, 0.0), 800.0, 45.0, np.array([1.0, 0.0, 0.0])
+        )
 
         np.testing.assert_array_equal(zero, np.zeros(3))
-        np.testing.assert_allclose(doubled, force * 2.0)
+        np.testing.assert_allclose(doubled, drag * 2.0)
+
+    def test_spring_force_has_damping_and_magnitude_limit(self):
+        force = spring_damper_force(
+            np.zeros(3), np.array([0.1, 0.0, 0.0]), np.zeros(3), 20.0, 1.0, 1.0
+        )
+        damping = spring_damper_force(
+            np.zeros(3), np.zeros(3), np.array([1.0, 0.0, 0.0]), 20.0, 1.0, 1.0
+        )
+        limited = spring_damper_force(
+            np.zeros(3), np.array([100.0, 0.0, 0.0]), np.zeros(3), 20.0, 1.0, 1.0
+        )
+
+        np.testing.assert_allclose(force, [2.0, 0.0, 0.0])
+        self.assertLess(damping[0], 0.0)
+        self.assertAlmostEqual(float(np.linalg.norm(limited)), 20.0)
+
+    def test_force_arrow_follows_grasp_point_and_force_direction(self):
+        model = mujoco.MjModel.from_xml_path("small_scene.xml")
+        scene = mujoco.MjvScene(model, maxgeom=100)
+        original_geom_count = model.ngeom
+        point = np.array([0.2, 0.1, 0.3])
+
+        draw_interaction_force(scene, point, np.array([10.0, 0.0, 0.0]), 2.0)
+
+        self.assertEqual(scene.ngeom, 1)
+        self.assertEqual(model.ngeom, original_geom_count)
+        arrow = scene.geoms[0]
+        self.assertEqual(arrow.type, int(mujoco.mjtGeom.mjGEOM_ARROW))
+        self.assertEqual(arrow.category, int(mujoco.mjtCatBit.mjCAT_DECOR))
+        np.testing.assert_allclose(arrow.rgba, [1.0, 0.08, 0.04, 0.95])
+        np.testing.assert_allclose(arrow.pos, point, atol=1e-6)
+        self.assertAlmostEqual(float(arrow.size[2]), 1.8)
+        np.testing.assert_allclose(arrow.mat[:, 2], [1.0, 0.0, 0.0], atol=1e-6)
+
+    def test_target_marker_and_line_are_decorative(self):
+        model = mujoco.MjModel.from_xml_path("small_scene.xml")
+        scene = mujoco.MjvScene(model, maxgeom=100)
+
+        draw_interaction_target(scene, np.zeros(3), np.array([1.0, 0.0, 0.0]), 2.0)
+
+        self.assertEqual(scene.ngeom, 2)
+        self.assertEqual(scene.geoms[0].type, int(mujoco.mjtGeom.mjGEOM_LINE))
+        self.assertEqual(scene.geoms[1].type, int(mujoco.mjtGeom.mjGEOM_SPHERE))
+        np.testing.assert_allclose(scene.geoms[1].pos, [1.0, 0.0, 0.0])
+
+    def test_zero_force_does_not_add_scene_geometry(self):
+        model = mujoco.MjModel.from_xml_path("small_scene.xml")
+        scene = mujoco.MjvScene(model, maxgeom=100)
+
+        draw_interaction_force(scene, np.zeros(3), np.zeros(3), 2.0)
+
+        self.assertEqual(scene.ngeom, 0)
 
 
 class WindowFrameTests(unittest.TestCase):
@@ -301,6 +395,26 @@ class WindowFrameTests(unittest.TestCase):
             ],
         )
 
+    def test_escape_requests_confirmation_without_closing_window(self):
+        viewer = Viewer(str(Path(__file__).with_name("small_scene.xml")))
+        exit_requests = []
+        viewer.inspector = SimpleNamespace(
+            backend=SimpleNamespace(keyboard_callback=lambda *_args: None),
+            request_exit=lambda: exit_requests.append(True),
+        )
+
+        with (
+            patch(
+                "main.imgui.get_io",
+                return_value=SimpleNamespace(want_capture_keyboard=False),
+            ),
+            patch("main.glfw.set_window_should_close") as set_should_close,
+        ):
+            viewer._on_key(object(), glfw.KEY_ESCAPE, 0, glfw.PRESS, 0)
+
+        self.assertEqual(exit_requests, [True])
+        set_should_close.assert_not_called()
+
 
 class ModelLoadingTests(unittest.TestCase):
     def test_cli_can_connect_to_orca_on_startup(self):
@@ -321,7 +435,7 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(viewer.model.ngeom, 0)
         self.assertEqual(viewer.zoom_speed, 0.18)
         self.assertEqual(viewer.pan_speed, 6.0)
-        self.assertEqual(viewer.near_clip_ratio, 0.001)
+        self.assertEqual(viewer.near_clip_ratio, 0.3)
         self.assertEqual(viewer.environment_preset, "blue")
         np.testing.assert_array_equal(viewer.option.geomgroup, np.ones(6))
         self.assertEqual(viewer.xml_text, "")
@@ -421,6 +535,81 @@ class LocalInteractionTests(unittest.TestCase):
         self.viewer.reset_interaction()
         self.assertEqual(self.viewer.data.time, 0.0)
         np.testing.assert_array_equal(self.viewer.data.qpos, self.viewer.model.qpos0)
+
+    def test_only_ctrl_left_press_starts_body_force(self):
+        self.viewer.interaction_enabled = True
+        self.viewer.scene = object()
+        self.viewer.inspector.backend = SimpleNamespace(
+            mouse_button_callback=lambda *_args: None
+        )
+        self.viewer.inspector.reveal_body = lambda _body_id: None
+        window = object()
+        with (
+            patch("main.imgui.get_io", return_value=SimpleNamespace(want_capture_mouse=False)),
+            patch("main.glfw.get_window_attrib", return_value=0),
+            patch("main.glfw.get_window_size", return_value=(800, 600)),
+            patch("main.glfw.get_framebuffer_size", return_value=(800, 600)),
+            patch("main.glfw.get_cursor_pos", return_value=(400.0, 300.0)),
+            patch(
+                "main.pick_geom",
+                return_value=SimpleNamespace(
+                    body_id=1, point=tuple(self.viewer.data.xpos[1])
+                ),
+            ) as pick,
+        ):
+            self.viewer._on_mouse_button(window, glfw.MOUSE_BUTTON_LEFT, glfw.PRESS, 0)
+            pick.assert_not_called()
+            self.assertEqual(self.viewer.force_body_id, -1)
+
+            self.viewer._on_mouse_button(window, glfw.MOUSE_BUTTON_LEFT, glfw.RELEASE, 0)
+            self.viewer._on_mouse_button(
+                window, glfw.MOUSE_BUTTON_LEFT, glfw.PRESS, glfw.MOD_CONTROL
+            )
+            pick.assert_called_once()
+            self.assertEqual(self.viewer.force_body_id, 1)
+
+    def test_spring_drag_applies_force_and_torque_at_grasp_point(self):
+        body_id = 1
+        self.viewer.force_body_id = body_id
+        self.viewer.force_local_point = np.array([0.05, 0.0, 0.0])
+        self.viewer.force_start = (
+            self.viewer.data.xpos[body_id] + self.viewer.force_local_point
+        )
+        self.viewer.force_target = self.viewer.force_start + np.array([0.1, 0.0, 0.0])
+
+        self.viewer._update_interaction_force()
+
+        np.testing.assert_allclose(self.viewer.force_point, self.viewer.force_start)
+        np.testing.assert_allclose(
+            self.viewer.data.xfrc_applied[body_id, :3], self.viewer.force_vector
+        )
+        expected_torque = np.cross(
+            self.viewer.force_point - self.viewer.data.xipos[body_id],
+            self.viewer.force_vector,
+        )
+        np.testing.assert_allclose(
+            self.viewer.data.xfrc_applied[body_id, 3:], expected_torque
+        )
+        self.assertGreater(np.linalg.norm(self.viewer.force_vector), 0.0)
+
+    def test_light_body_spring_drag_is_stable_and_converges(self):
+        body_id = 1
+        self.viewer.model.opt.gravity[:] = 0.0
+        self.viewer.force_body_id = body_id
+        self.viewer.force_local_point = np.zeros(3)
+        self.viewer.force_start = self.viewer.data.xpos[body_id].copy()
+        self.viewer.force_target = self.viewer.force_start + np.array([0.002, 0.0, 0.0])
+
+        for _step in range(2000):
+            self.viewer._update_interaction_force()
+            mujoco.mj_step(self.viewer.model, self.viewer.data)
+
+        self.assertTrue(np.all(np.isfinite(self.viewer.data.qpos)))
+        self.assertLess(
+            np.linalg.norm(self.viewer.data.xpos[body_id] - self.viewer.force_target),
+            1e-5,
+        )
+        self.assertLess(np.linalg.norm(self.viewer.data.qvel), 1e-3)
 
     def test_external_force_is_cleared(self):
         self.viewer.force_body_id = 1

@@ -9,6 +9,7 @@ class Selection:
     body_id: int = -1
     geom_id: int = -1
     joint_id: int = -1
+    point: tuple | None = None
 
     @property
     def valid(self):
@@ -174,7 +175,9 @@ def pick_geom(
     )
     if body_id < 0 or geom_id[0] < 0:
         return Selection()
-    return Selection(int(body_id), int(geom_id[0]))
+    return Selection(
+        int(body_id), int(geom_id[0]), point=tuple(float(value) for value in selected_point)
+    )
 
 
 def apply_highlight(scene, selection, model_index):

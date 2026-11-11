@@ -96,10 +96,11 @@ class InspectorUI:
         self.on_single_step = None
         self.on_reset_simulation = None
         self.on_push_state = None
+        self.on_exit = None
+        self.exit_popup_open = False
         self.mode = "view"
         self.local_running = False
         self.force_strength = 20.0
-        self.interaction_joint_id = 0
         self.orca_push_busy = False
         self.orca_address = "localhost:50051"
         self.orca_busy = False
@@ -147,6 +148,9 @@ class InspectorUI:
         body_id = self.focus_body
         self.focus_body = None
         return body_id
+
+    def request_exit(self):
+        self.exit_popup_open = True
 
     def rebind_model(self, model, data, model_index, xml_name, xml_text):
         self.model = model
@@ -471,6 +475,7 @@ class InspectorUI:
             max_right, max(min_right, self.right_panel_width - right_delta)
         )
         self._draw_xml_popup()
+        self._draw_exit_confirmation(window_width, window_height)
         self.open_bodies.clear()
         self.scroll_body = None
         return selection, zoom_speed, pan_speed, environment_preset, near_clip_ratio
@@ -535,11 +540,14 @@ class InspectorUI:
                 imgui.pop_font()
 
     def _draw_interaction_controls(self):
-        imgui.text_wrapped("在视口中按住并拖动 Body 施加外力，松开鼠标立即清零。")
-        imgui.text("外力强度")
+        imgui.text_wrapped(
+            "按住 Ctrl + 鼠标左键拖动 Body，黄色目标点通过弹簧阻尼牵引抓取点，"
+            "红色箭头显示实际力；普通左键仍用于点选和旋转。"
+        )
+        imgui.text("弹簧刚度")
         imgui.set_next_item_width(-1)
         _changed, self.force_strength = imgui.slider_float(
-            "##外力强度",
+            "##弹簧刚度",
             self.force_strength,
             0.1,
             1000.0,
@@ -569,22 +577,28 @@ class InspectorUI:
         if self.model.njnt == 0:
             imgui.text_disabled("当前模型无 Joint")
             return
-        self.interaction_joint_id = min(
-            self.interaction_joint_id, self.model.njnt - 1
-        )
-        joint_id = self.interaction_joint_id
-        preview = f"[{joint_id}] {self.index.joint_name(joint_id)}"
-        if imgui.begin_combo("选择 Joint", preview):
-            for candidate in range(self.model.njnt):
-                label = f"[{candidate}] {self.index.joint_name(candidate)}"
-                _selected, clicked = imgui.selectable(
-                    label, candidate == joint_id
+        for joint_id in range(self.model.njnt):
+            body_id = int(self.model.jnt_bodyid[joint_id])
+            depth = 0
+            while body_id > 0:
+                depth += 1
+                body_id = int(self.model.body_parentid[body_id])
+            if depth:
+                imgui.indent(depth * 18.0)
+            try:
+                joint_type = int(self.model.jnt_type[joint_id])
+                imgui.text_colored(
+                    (1.0, 0.75, 0.3, 1.0),
+                    f"[{joint_id}] {self.index.joint_name(joint_id)}"
+                    f" · {_joint_type(joint_type)}",
                 )
-                if clicked:
-                    self.interaction_joint_id = candidate
-                    joint_id = candidate
-            imgui.end_combo()
+                self._draw_interaction_joint(joint_id)
+                imgui.spacing()
+            finally:
+                if depth:
+                    imgui.unindent(depth * 18.0)
 
+    def _draw_interaction_joint(self, joint_id):
         joint_type = int(self.model.jnt_type[joint_id])
         address = int(self.model.jnt_qposadr[joint_id])
         extent = max(float(self.model.stat.extent), 1e-3)
@@ -718,6 +732,39 @@ class InspectorUI:
                         _end_properties()
                     imgui.unindent()
             imgui.unindent()
+
+    def _draw_exit_confirmation(self, window_width, window_height):
+        if not self.exit_popup_open:
+            return
+        imgui.open_popup("确认退出")
+        imgui.set_next_window_pos(
+            imgui.ImVec2(window_width * 0.5, window_height * 0.5),
+            imgui.Cond_.always,
+            imgui.ImVec2(0.5, 0.5),
+        )
+        imgui.set_next_window_size(
+            imgui.ImVec2(360, 0), imgui.Cond_.appearing
+        )
+        expanded, opened = imgui.begin_popup_modal(
+            "确认退出", True, imgui.WindowFlags_.no_resize
+        )
+        self.exit_popup_open = opened
+        if not expanded:
+            return
+        try:
+            imgui.text_wrapped("确定要退出 MuJoCo 模型检查器吗？")
+            imgui.spacing()
+            if imgui.button("取消", imgui.ImVec2(120, 28)):
+                self.exit_popup_open = False
+                imgui.close_current_popup()
+            imgui.same_line()
+            if imgui.button("退出", imgui.ImVec2(120, 28)):
+                self.exit_popup_open = False
+                imgui.close_current_popup()
+                if self.on_exit is not None:
+                    self.on_exit()
+        finally:
+            imgui.end_popup()
 
     def _draw_xml_popup(self):
         if not self.xml_popup_open:

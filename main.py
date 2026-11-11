@@ -31,7 +31,7 @@ from model_sources import (
 
 ZOOM_SPEED = 0.18
 PAN_SPEED = 6.0
-NEAR_CLIP_RATIO = 0.001
+NEAR_CLIP_RATIO = 0.3
 KEYBOARD_MOVE_SPEED = 300.0
 CLOSE_ZOOM_RANGE = 0.1
 MIN_CLOSE_ZOOM_FACTOR = 0.1
@@ -223,12 +223,11 @@ def keyboard_move_camera(
     cam.lookat[:] += movement / length * units_per_second * frame_time
 
 
-def interaction_force(cam, drag, viewport_height, fovy, extent, strength):
+def interaction_drag(cam, drag, viewport_height, fovy, reference_point):
     if viewport_height <= 0:
         return np.zeros(3)
     azimuth = math.radians(cam.azimuth)
     elevation = math.radians(cam.elevation)
-    right = np.array([-math.sin(azimuth), math.cos(azimuth), 0.0])
     up = np.array(
         [
             -math.sin(elevation) * math.cos(azimuth),
@@ -236,12 +235,102 @@ def interaction_force(cam, drag, viewport_height, fovy, extent, strength):
             math.cos(elevation),
         ]
     )
-    units_per_pixel = (
-        2.0 * cam.distance * math.tan(math.radians(fovy) * 0.5) / viewport_height
+    forward = np.array(
+        [
+            math.cos(elevation) * math.cos(azimuth),
+            math.cos(elevation) * math.sin(azimuth),
+            math.sin(elevation),
+        ]
     )
-    units_per_pixel *= close_step_scale(cam.distance, extent)
+    right = np.cross(forward, up)
+    camera_position = np.asarray(cam.lookat) - forward * cam.distance
+    depth = max(float(np.dot(np.asarray(reference_point) - camera_position, forward)), 1e-6)
+    units_per_pixel = 2.0 * depth * math.tan(math.radians(fovy) * 0.5) / viewport_height
     dx, dy = drag
-    return (right * dx - up * dy) * units_per_pixel * float(strength)
+    return (right * dx - up * dy) * units_per_pixel
+
+
+def spring_damper_force(point, target, velocity, strength, mass, extent):
+    stiffness = max(float(strength), 0.0)
+    if stiffness == 0.0:
+        return np.zeros(3)
+    mass = max(float(mass), 1e-6)
+    damping = 2.0 * math.sqrt(stiffness)
+    acceleration = stiffness * (np.asarray(target) - np.asarray(point))
+    acceleration -= damping * np.asarray(velocity)
+    force = mass * acceleration
+    magnitude = float(np.linalg.norm(force))
+    maximum = mass * max(stiffness * _valid_extent(extent), 1.0)
+    if magnitude > maximum:
+        force *= maximum / magnitude
+    return force
+
+
+def draw_interaction_force(scene, point, force, extent):
+    magnitude = float(np.linalg.norm(force))
+    if magnitude <= 1e-12 or scene.ngeom >= scene.maxgeom:
+        return
+    start = np.asarray(point, dtype=float)
+    length = min(extent * (0.1 + 0.08 * magnitude), extent)
+    end = start + np.asarray(force) / magnitude * length
+    geom = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(
+        geom,
+        mujoco.mjtGeom.mjGEOM_ARROW,
+        np.zeros(3),
+        np.zeros(3),
+        np.eye(3).ravel(),
+        np.array([1.0, 0.08, 0.04, 0.95], dtype=np.float32),
+    )
+    mujoco.mjv_connector(
+        geom,
+        mujoco.mjtGeom.mjGEOM_ARROW,
+        extent * 0.008,
+        start,
+        end,
+    )
+    geom.emission = 0.25
+    geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+    scene.ngeom += 1
+
+
+def draw_interaction_target(scene, point, target, extent):
+    point = np.asarray(point, dtype=float)
+    target = np.asarray(target, dtype=float)
+    color = np.array([1.0, 0.72, 0.08, 0.9], dtype=np.float32)
+    if np.linalg.norm(target - point) > 1e-9 and scene.ngeom < scene.maxgeom:
+        line = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(
+            line,
+            mujoco.mjtGeom.mjGEOM_LINE,
+            np.zeros(3),
+            np.zeros(3),
+            np.eye(3).ravel(),
+            color,
+        )
+        mujoco.mjv_connector(
+            line,
+            mujoco.mjtGeom.mjGEOM_LINE,
+            extent * 0.003,
+            point,
+            target,
+        )
+        line.emission = 0.6
+        line.category = mujoco.mjtCatBit.mjCAT_DECOR
+        scene.ngeom += 1
+    if scene.ngeom < scene.maxgeom:
+        marker = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(
+            marker,
+            mujoco.mjtGeom.mjGEOM_SPHERE,
+            np.array([extent * 0.015, 0.0, 0.0]),
+            target,
+            np.eye(3).ravel(),
+            color,
+        )
+        marker.emission = 0.8
+        marker.category = mujoco.mjtCatBit.mjCAT_DECOR
+        scene.ngeom += 1
 
 
 def draw_environment_background(color):
@@ -330,6 +419,10 @@ class Viewer:
         self.force_strength = 20.0
         self.force_body_id = -1
         self.force_vector = np.zeros(3)
+        self.force_local_point = np.zeros(3)
+        self.force_start = np.zeros(3)
+        self.force_target = np.zeros(3)
+        self.force_point = np.zeros(3)
         self.accumulator = 0.0
         self.last_time = time.perf_counter()
         self.buttons = set()
@@ -491,6 +584,43 @@ class Viewer:
             self.data.xfrc_applied[self.force_body_id] = 0.0
         self.force_body_id = -1
         self.force_vector = np.zeros(3)
+        self.force_local_point = np.zeros(3)
+        self.force_start = np.zeros(3)
+        self.force_target = np.zeros(3)
+        self.force_point = np.zeros(3)
+
+    def _update_interaction_force(self):
+        body_id = self.force_body_id
+        if body_id < 0:
+            return
+        rotation = np.asarray(self.data.xmat[body_id]).reshape(3, 3)
+        point = self.data.xpos[body_id] + rotation @ self.force_local_point
+        body_velocity = np.zeros(6)
+        mujoco.mj_objectVelocity(
+            self.model,
+            self.data,
+            mujoco.mjtObj.mjOBJ_BODY,
+            body_id,
+            body_velocity,
+            0,
+        )
+        point_velocity = body_velocity[3:] + np.cross(
+            body_velocity[:3], point - self.data.xipos[body_id]
+        )
+        force = spring_damper_force(
+            point,
+            self.force_target,
+            point_velocity,
+            self.force_strength,
+            self.model.body_mass[body_id],
+            self.extent,
+        )
+        self.force_point = point
+        self.force_vector = force
+        self.data.xfrc_applied[body_id, :3] = force
+        self.data.xfrc_applied[body_id, 3:] = np.cross(
+            point - self.data.xipos[body_id], force
+        )
 
     def set_mode(self, mode, address):
         if mode != "interaction":
@@ -530,6 +660,7 @@ class Viewer:
 
     def step_interaction(self):
         if self.interaction_enabled and not self.running:
+            self._update_interaction_force()
             mujoco.mj_step(self.model, self.data)
 
     def reset_interaction(self):
@@ -872,7 +1003,11 @@ class Viewer:
             if button == glfw.MOUSE_BUTTON_LEFT:
                 self.left_press_origin = self.last_cursor
                 self.left_dragging = False
-                if self.interaction_enabled and self.scene is not None:
+                if (
+                    self.interaction_enabled
+                    and mods & glfw.MOD_CONTROL
+                    and self.scene is not None
+                ):
                     picked = pick_geom(
                         self.model,
                         self.data,
@@ -882,10 +1017,19 @@ class Viewer:
                         glfw.get_window_size(window),
                         glfw.get_framebuffer_size(window),
                     )
-                    if picked.body_id > 0:
+                    if picked.body_id > 0 and picked.point is not None:
+                        point = np.asarray(picked.point, dtype=float)
+                        rotation = np.asarray(self.data.xmat[picked.body_id]).reshape(3, 3)
                         self.force_body_id = picked.body_id
+                        self.force_local_point = (
+                            rotation.T @ (point - self.data.xpos[picked.body_id])
+                        )
+                        self.force_start = point.copy()
+                        self.force_target = point.copy()
+                        self.force_point = point.copy()
                         self.selection = picked
                         self.inspector.reveal_body(picked.body_id)
+                        self._update_interaction_force()
         elif action == glfw.RELEASE:
             was_active = button in self.buttons
             self.buttons.discard(button)
@@ -956,15 +1100,14 @@ class Viewer:
             if not self.left_dragging and not is_click(self.left_press_origin, (x, y)):
                 self.left_dragging = True
             if self.left_dragging and self.force_body_id > 0:
-                self.force_vector = interaction_force(
+                self.force_target = self.force_start + interaction_drag(
                     self.camera,
                     (x - self.left_press_origin[0], y - self.left_press_origin[1]),
                     glfw.get_window_size(window)[1],
                     self.model.vis.global_.fovy,
-                    self.extent,
-                    self.force_strength,
+                    self.force_start,
                 )
-                self.data.xfrc_applied[self.force_body_id, :3] = self.force_vector
+                self._update_interaction_force()
             elif self.left_dragging:
                 orbit_camera(self.camera, dx, dy)
         else:
@@ -1020,7 +1163,7 @@ class Viewer:
         if action != glfw.PRESS:
             return
         if key == glfw.KEY_ESCAPE:
-            glfw.set_window_should_close(window, True)
+            self.inspector.request_exit()
         elif key == glfw.KEY_SPACE and self.interaction_enabled:
             self.toggle_interaction_running()
             self._update_title()
@@ -1067,6 +1210,7 @@ class Viewer:
         timestep = self.model.opt.timestep
         steps = 0
         while self.accumulator >= timestep and steps < 20:
+            self._update_interaction_force()
             mujoco.mj_step(self.model, self.data)
             self.accumulator -= timestep
             steps += 1
@@ -1154,6 +1298,16 @@ class Viewer:
             if self.selection.valid:
                 self.inspector.reveal_body(self.selection.body_id)
         apply_highlight(self.scene, self.selection, self.model_index)
+        if self.force_body_id > 0:
+            visual_extent = min(
+                self.extent, max(self.camera.distance * 0.35, 1e-6)
+            )
+            draw_interaction_force(
+                self.scene, self.force_point, self.force_vector, visual_extent
+            )
+            draw_interaction_target(
+                self.scene, self.force_point, self.force_target, visual_extent
+            )
 
         viewport = mujoco.MjrRect(0, 0, width, height)
         mujoco.mjr_render(viewport, self.scene, self.context)
@@ -1198,6 +1352,7 @@ class Viewer:
             self.inspector.on_single_step = self.step_interaction
             self.inspector.on_reset_simulation = self.reset_interaction
             self.inspector.on_push_state = self.push_local_state
+            self.inspector.on_exit = lambda: glfw.set_window_should_close(self.window, True)
             self.inspector.rebind_model(
                 self.model,
                 self.data,
@@ -1227,7 +1382,7 @@ class Viewer:
                 f"滚轮缩放 {self.zoom_speed * 100:.1f}%/格"
             )
             print("WASD 前后左右移动，Q/E 下降/上升")
-            print("Space 播放/暂停，. 单步，R 重置，Home 全景，Esc 退出")
+            print("Space 播放/暂停，. 单步，R 重置，Home 全景，Esc 打开退出确认")
 
             while not glfw.window_should_close(self.window):
                 glfw.poll_events()
