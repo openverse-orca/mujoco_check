@@ -517,6 +517,22 @@ class LocalInteractionTests(unittest.TestCase):
             self.assertEqual(self.viewer.inspector.mode, "view")
             self.assertTrue(stop_event.is_set())
 
+    def test_leaving_interaction_restores_initial_simulation_state(self):
+        with patch("main.threading.Thread"):
+            self.viewer.set_mode("interaction", "localhost:50051")
+        self.viewer.data.qpos[0] += 0.01
+        self.viewer.data.qvel[:] = 0.25
+        self.viewer.data.time = 2.0
+        mujoco.mj_forward(self.viewer.model, self.viewer.data)
+
+        self.viewer.set_mode("view", "localhost:50051")
+
+        self.assertEqual(self.viewer.data.time, 0.0)
+        np.testing.assert_array_equal(self.viewer.data.qpos, self.viewer.model.qpos0)
+        np.testing.assert_array_equal(
+            self.viewer.data.qvel, np.zeros(self.viewer.model.nv)
+        )
+
     def test_view_does_not_step_and_interaction_controls_local_simulation(self):
         self.viewer.inspector = None
         original_qvel = self.viewer.data.qvel.copy()

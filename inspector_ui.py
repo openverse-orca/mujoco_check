@@ -97,7 +97,9 @@ class InspectorUI:
         self.on_reset_simulation = None
         self.on_push_state = None
         self.on_exit = None
+        self.on_ground_change = None
         self.exit_popup_open = False
+        self.ground_injected = False
         self.mode = "view"
         self.local_running = False
         self.force_strength = 20.0
@@ -208,6 +210,12 @@ class InspectorUI:
         if imgui.button("拉取 XML") and self.on_orca_pull is not None:
             self.on_orca_pull(self.orca_address)
         imgui.end_disabled()
+        imgui.begin_disabled(self.orca_busy or not self.xml_text)
+        ground_label = "移除本地地面" if self.ground_injected else "注入本地地面"
+        if imgui.button(ground_label) and self.on_ground_change is not None:
+            self.on_ground_change(not self.ground_injected)
+        imgui.end_disabled()
+        imgui.text_disabled("本地地面仅影响本地模型和仿真，不写入 OrcaLab")
         imgui.separator_text("运行模式")
         for mode, label in (
             ("view", "模型查看"),

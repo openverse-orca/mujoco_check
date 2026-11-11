@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import math
 import queue
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ from inspection import (
     pick_geom,
 )
 from inspector_ui import APP_NAME, InspectorUI
+from model_injection import inject_ground, joint_layout
 from model_sources import (
     cleanup_orca_fetch,
     fetch_orca_xml,
@@ -394,6 +396,10 @@ class Viewer:
             if self.xml_path is not None
             else ""
         )
+        self.effective_xml_text = self.xml_text
+        self.ground_injected = False
+        self.base_joint_layout = joint_layout(self.model)
+        self.orca_resource_dir = None
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
 
@@ -459,13 +465,37 @@ class Viewer:
         if self.inspector is not None:
             self.inspector.set_source_status(text, error)
 
-    def load_xml(self, xml_path):
-        path = Path(xml_path).expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"XML 文件不存在：{path}")
+    def _compile_candidate(
+        self,
+        path,
+        base_xml_text,
+        ground_enabled,
+        expected_layout=None,
+        from_path=False,
+    ):
+        effective_xml_text = inject_ground(base_xml_text) if ground_enabled else base_xml_text
+        if from_path:
+            model = mujoco.MjModel.from_xml_path(str(path))
+        else:
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    suffix=".xml",
+                    prefix=".mtool_",
+                    dir=path.parent,
+                    delete=False,
+                ) as stream:
+                    stream.write(effective_xml_text)
+                    temporary_path = Path(stream.name)
+                model = mujoco.MjModel.from_xml_path(str(temporary_path))
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
 
-        xml_text = path.read_text(encoding="utf-8")
-        model = mujoco.MjModel.from_xml_path(str(path))
+        if expected_layout is not None and joint_layout(model) != expected_layout:
+            raise ValueError("注入后 Joint 布局发生变化，已取消加载")
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
         model_index = ModelIndex(model)
@@ -480,14 +510,22 @@ class Viewer:
             if context is not None:
                 context.free()
             raise
+        return model, data, model_index, scene, context, effective_xml_text
 
+    def _commit_model(
+        self, path, base_xml_text, ground_enabled, candidate
+    ):
+        model, data, model_index, scene, context, effective_xml_text = candidate
         self.stop_orca_sync()
         self.stop_orca_push()
         self._clear_external_force()
         self.interaction_enabled = False
         old_context = self.context
         self.xml_path = path
-        self.xml_text = xml_text
+        self.xml_text = base_xml_text
+        self.effective_xml_text = effective_xml_text
+        self.ground_injected = ground_enabled
+        self.base_joint_layout = joint_layout(model)
         self.model = model
         self.data = data
         self.model_index = model_index
@@ -507,13 +545,51 @@ class Viewer:
             self.inspector.orca_sync_enabled = False
             self.inspector.orca_push_busy = False
             self.inspector.local_running = False
+            self.inspector.ground_injected = ground_enabled
             self.inspector.rebind_model(
-                model, data, model_index, self.model_name, self.xml_text
+                model, data, model_index, self.model_name, self.effective_xml_text
             )
         self._reset_camera()
         self._update_title()
         if old_context is not None:
             old_context.free()
+
+    def _replace_orca_resource_dir(self, resource_dir):
+        old_resource_dir = self.orca_resource_dir
+        self.orca_resource_dir = resource_dir
+        if old_resource_dir is not None and old_resource_dir != resource_dir:
+            cleanup_orca_fetch(old_resource_dir)
+
+    def load_xml(self, xml_path, resource_dir=None):
+        path = Path(xml_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"XML 文件不存在：{path}")
+
+        xml_text = path.read_text(encoding="utf-8")
+        candidate = self._compile_candidate(path, xml_text, False, from_path=True)
+        self._commit_model(path, xml_text, False, candidate)
+        self._replace_orca_resource_dir(resource_dir)
+
+    def set_ground_enabled(self, enabled):
+        enabled = bool(enabled)
+        if self.xml_path is None or enabled == self.ground_injected:
+            return
+        try:
+            candidate = self._compile_candidate(
+                self.xml_path,
+                self.xml_text,
+                enabled,
+                expected_layout=self.base_joint_layout,
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            self._set_source_status(f"地面注入失败：{error}", True)
+            return
+        self._commit_model(self.xml_path, self.xml_text, enabled, candidate)
+        self._set_source_status(
+            "已注入本地地面，仅影响本地模型和仿真"
+            if enabled
+            else "已移除本地地面"
+        )
 
     def load_local_xml(self, xml_path):
         self.orca_request_id += 1
@@ -568,16 +644,17 @@ class Viewer:
             self.orca_loading = False
             self.inspector.orca_busy = False
             if error is not None:
+                if cache_dir is not None:
+                    cleanup_orca_fetch(cache_dir)
                 self._set_source_status(f"OrcaLab 拉取失败：{error}", True)
                 continue
             try:
-                self.load_xml(xml_path)
+                self.load_xml(xml_path, resource_dir=cache_dir)
             except (OSError, ValueError, RuntimeError) as load_error:
+                cleanup_orca_fetch(cache_dir)
                 self._set_source_status(f"模型加载失败：{load_error}", True)
             else:
                 self._set_source_status(f"已从 OrcaLab 加载：{self.model_name}")
-            finally:
-                cleanup_orca_fetch(cache_dir)
 
     def _clear_external_force(self):
         if self.force_body_id >= 0:
@@ -623,6 +700,8 @@ class Viewer:
         )
 
     def set_mode(self, mode, address):
+        if mode == "view" and self.interaction_enabled:
+            self.reset_interaction()
         if mode != "interaction":
             self.stop_orca_push()
         if mode == "sync":
@@ -1352,6 +1431,7 @@ class Viewer:
             self.inspector.on_single_step = self.step_interaction
             self.inspector.on_reset_simulation = self.reset_interaction
             self.inspector.on_push_state = self.push_local_state
+            self.inspector.on_ground_change = self.set_ground_enabled
             self.inspector.on_exit = lambda: glfw.set_window_should_close(self.window, True)
             self.inspector.rebind_model(
                 self.model,
@@ -1411,6 +1491,7 @@ class Viewer:
             if self.window is not None:
                 glfw.destroy_window(self.window)
                 self.window = None
+            self._replace_orca_resource_dir(None)
             glfw.terminate()
 
 
