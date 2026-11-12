@@ -27,6 +27,15 @@ def _joint_type(joint_type):
     return mujoco.mjtJoint(int(joint_type)).name.removeprefix("mjJNT_").lower()
 
 
+def _joint_depth(model, joint_id):
+    body_id = int(model.jnt_bodyid[joint_id])
+    depth = 0
+    while body_id > 0:
+        depth += 1
+        body_id = int(model.body_parentid[body_id])
+    return depth
+
+
 def _geom_type(geom_type):
     return mujoco.mjtGeom(int(geom_type)).name.removeprefix("mjGEOM_").lower()
 
@@ -83,6 +92,7 @@ class InspectorUI:
         self.left_panel_width = float(self.tree_width)
         self.right_panel_width = float(self.panel_width)
         self.open_bodies = set()
+        self.expanded_joints = set()
         self.scroll_body = None
         self.focus_body = None
         self.window_drag_origin = None
@@ -172,6 +182,7 @@ class InspectorUI:
         self.xml_search_index = -1
         self.xml_scroll_line = None
         self.open_bodies.clear()
+        self.expanded_joints.clear()
         self.scroll_body = None
         self.focus_body = None
 
@@ -618,28 +629,66 @@ class InspectorUI:
         if self.model.njnt == 0:
             imgui.text_disabled("当前模型无 Joint")
             return
+        multi_dof_ids = [
+            joint_id
+            for joint_id in range(self.model.njnt)
+            if int(self.model.jnt_type[joint_id])
+            in (int(mujoco.mjtJoint.mjJNT_BALL), int(mujoco.mjtJoint.mjJNT_FREE))
+        ]
+        imgui.begin_disabled(not multi_dof_ids)
+        if imgui.button("全部展开##joints"):
+            self.expanded_joints.update(multi_dof_ids)
+        imgui.same_line()
+        if imgui.button("全部收起##joints"):
+            self.expanded_joints.clear()
+        imgui.end_disabled()
+        imgui.spacing()
         for joint_id in range(self.model.njnt):
-            body_id = int(self.model.jnt_bodyid[joint_id])
-            depth = 0
-            while body_id > 0:
-                depth += 1
-                body_id = int(self.model.body_parentid[body_id])
-            if depth:
-                imgui.indent(depth * 18.0)
+            self._draw_joint_state(joint_id)
+            imgui.spacing()
+
+    def _draw_joint_state(self, joint_id):
+        joint_type = int(self.model.jnt_type[joint_id])
+        multi_dof = joint_type in (
+            int(mujoco.mjtJoint.mjJNT_BALL),
+            int(mujoco.mjtJoint.mjJNT_FREE),
+        )
+        indentation = _joint_depth(self.model, joint_id) * 14.0
+        imgui.push_id(f"joint_state_{joint_id}")
+        try:
+            if indentation:
+                imgui.indent(indentation)
             try:
-                joint_type = int(self.model.jnt_type[joint_id])
+                if multi_dof:
+                    expanded = joint_id in self.expanded_joints
+                    symbol = "-" if expanded else "+"
+                    if imgui.button(symbol + "##expand", imgui.ImVec2(24, 0)):
+                        if expanded:
+                            self.expanded_joints.discard(joint_id)
+                        else:
+                            self.expanded_joints.add(joint_id)
+                    imgui.same_line()
                 imgui.text_colored(
                     (1.0, 0.75, 0.3, 1.0),
                     f"[{joint_id}] {self.index.joint_name(joint_id)}"
                     f" · {_joint_type(joint_type)}",
                 )
-                self._draw_interaction_joint(joint_id)
-                imgui.spacing()
+                if multi_dof:
+                    if joint_id in self.expanded_joints:
+                        imgui.indent(16.0)
+                        try:
+                            self._draw_interaction_joint(joint_id)
+                        finally:
+                            imgui.unindent(16.0)
+                else:
+                    self._draw_interaction_joint(joint_id, compact=True)
             finally:
-                if depth:
-                    imgui.unindent(depth * 18.0)
+                if indentation:
+                    imgui.unindent(indentation)
+        finally:
+            imgui.pop_id()
 
-    def _draw_interaction_joint(self, joint_id):
+    def _draw_interaction_joint(self, joint_id, compact=False):
         joint_type = int(self.model.jnt_type[joint_id])
         address = int(self.model.jnt_qposadr[joint_id])
         extent = max(float(self.model.stat.extent), 1e-3)
@@ -662,7 +711,11 @@ class InspectorUI:
                     maximum = max(extent, current)
                 imgui.set_next_item_width(-1)
                 changed, value = imgui.slider_float(
-                    "qpos", current, minimum, maximum, "%.6f"
+                    "##qpos" if compact else "qpos",
+                    current,
+                    minimum,
+                    maximum,
+                    "%.6f",
                 )
                 if changed and self.on_joint_set is not None:
                     if self.on_joint_set(joint_id, [value]) is not False:

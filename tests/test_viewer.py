@@ -12,6 +12,7 @@ import mujoco
 import numpy as np
 
 from mtool.inspection import project_to_window
+from mtool.inspector_ui import _joint_depth
 from mtool.main import (
     Viewer,
     MIN_CLOSE_ZOOM_FACTOR,
@@ -36,6 +37,28 @@ from mtool.main import (
 
 
 SCENE_PATH = Path(__file__).with_name("small_scene.xml")
+
+
+class JointPresentationTests(unittest.TestCase):
+    def test_joint_depth_follows_body_hierarchy(self):
+        model = mujoco.MjModel.from_xml_string(
+            """
+            <mujoco>
+              <worldbody>
+                <body name="root">
+                  <joint name="hinge" type="hinge"/>
+                  <geom size="0.1"/>
+                  <body name="child">
+                    <joint name="slide" type="slide"/>
+                    <geom size="0.1"/>
+                  </body>
+                </body>
+              </worldbody>
+            </mujoco>
+            """
+        )
+        self.assertEqual(_joint_depth(model, 0), 1)
+        self.assertEqual(_joint_depth(model, 1), 2)
 
 
 class CameraTests(unittest.TestCase):
