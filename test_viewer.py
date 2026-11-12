@@ -978,5 +978,237 @@ class OrcaSyncTests(unittest.TestCase):
         np.testing.assert_array_equal(viewer.data.qvel, original_qvel)
 
 
+class MultiViewTests(unittest.TestCase):
+    def setUp(self):
+        self.viewer = Viewer(Path(__file__).with_name("small_scene.xml"))
+
+    def test_add_view_copies_camera_values_without_sharing_camera(self):
+        source_view = self.viewer.active_view
+        source_camera = source_view.camera
+        source_camera.azimuth = 37.0
+        source_camera.elevation = -22.0
+        source_camera.distance = 4.5
+        source_camera.lookat[:] = [0.1, 0.2, 0.3]
+        source_values = (
+            source_camera.type,
+            source_camera.azimuth,
+            source_camera.elevation,
+            source_camera.distance,
+        )
+        source_lookat = source_camera.lookat.copy()
+        model = self.viewer.model
+        data = self.viewer.data
+
+        new_view_id = self.viewer.add_view()
+        new_view = self.viewer.active_view
+        new_camera = new_view.camera
+
+        self.assertEqual(new_view.id, new_view_id)
+        self.assertEqual(self.viewer.active_view_id, new_view_id)
+        self.assertIsNot(new_camera, source_camera)
+        self.assertEqual(
+            (
+                new_camera.type,
+                new_camera.azimuth,
+                new_camera.elevation,
+                new_camera.distance,
+            ),
+            source_values,
+        )
+        np.testing.assert_array_equal(new_camera.lookat, source_lookat)
+        self.assertIs(self.viewer.model, model)
+        self.assertIs(self.viewer.data, data)
+
+        new_camera.azimuth = 120.0
+        new_camera.elevation = 15.0
+        new_camera.distance = 8.0
+        new_camera.lookat[:] = [1.0, 2.0, 3.0]
+
+        self.assertEqual(source_camera.type, source_values[0])
+        self.assertEqual(source_camera.azimuth, source_values[1])
+        self.assertEqual(source_camera.elevation, source_values[2])
+        self.assertEqual(source_camera.distance, source_values[3])
+        np.testing.assert_array_equal(source_camera.lookat, source_lookat)
+
+    def test_close_view_keeps_valid_active_view_and_never_reuses_ids(self):
+        first_id = self.viewer.active_view_id
+        middle_id = self.viewer.add_view()
+        active_id = self.viewer.add_view()
+
+        self.viewer.close_view(middle_id)
+
+        self.assertEqual(
+            [view.id for view in self.viewer.viewports], [first_id, active_id]
+        )
+        self.assertEqual(self.viewer.active_view_id, active_id)
+
+        self.viewer.close_view(active_id)
+
+        self.assertEqual([view.id for view in self.viewer.viewports], [first_id])
+        self.assertEqual(self.viewer.active_view_id, first_id)
+        self.assertEqual(self.viewer.active_view.id, first_id)
+
+        new_id = self.viewer.add_view()
+        self.assertNotIn(new_id, (first_id, middle_id, active_id))
+        self.viewer.close_view(first_id)
+        self.assertEqual(self.viewer.active_view_id, new_id)
+
+        self.viewer.close_view(new_id)
+        self.assertEqual([view.id for view in self.viewer.viewports], [new_id])
+        self.assertEqual(self.viewer.active_view_id, new_id)
+        self.assertEqual(self.viewer.active_view.id, new_id)
+
+    def test_update_view_layout_uses_content_rect_and_hidpi_framebuffer(self):
+        self.viewer.add_view()
+        self.viewer.inspector = SimpleNamespace(content_rect=(100, 50, 600, 400))
+
+        self.viewer._update_view_layout(
+            window_size=(800, 600), framebuffer_size=(1600, 1200)
+        )
+
+        self.assertEqual(
+            [
+                (view.rect.x, view.rect.y, view.rect.width, view.rect.height)
+                for view in self.viewer.viewports
+            ],
+            [(100.0, 50.0, 300.0, 400.0), (400.0, 50.0, 300.0, 400.0)],
+        )
+        self.assertEqual(
+            [view.framebuffer_rect for view in self.viewer.viewports],
+            [(200, 300, 600, 800), (800, 300, 600, 800)],
+        )
+
+    def test_render_updates_and_draws_all_three_viewports(self):
+        self.viewer.add_view()
+        self.viewer.add_view()
+        scenes = [SimpleNamespace(camera=[]) for _view in self.viewer.viewports]
+        for view, scene in zip(self.viewer.viewports, scenes):
+            view.scene = scene
+        self.viewer.window = object()
+        self.viewer.context = object()
+        self.viewer.inspector = SimpleNamespace(
+            content_rect=(100, 50, 600, 400),
+            begin_frame=lambda: None,
+            draw=lambda *_args: (
+                self.viewer.selection,
+                self.viewer.zoom_speed,
+                self.viewer.pan_speed,
+                self.viewer.environment_preset,
+                self.viewer.near_clip_ratio,
+            ),
+            consume_focus_request=lambda: None,
+            draw_object_label=lambda *_args, **_kwargs: None,
+            end_frame=lambda: None,
+        )
+
+        with (
+            patch("main.glfw.get_framebuffer_size", return_value=(1600, 1200)),
+            patch("main.glfw.get_window_size", return_value=(800, 600)),
+            patch("main.GL"),
+            patch("main.glfw.swap_buffers") as swap_buffers,
+            patch("main.mujoco.mjv_updateScene") as update_scene,
+            patch("main.mujoco.mjr_render") as render,
+            patch("main.mujoco.MjrRect", side_effect=lambda *args: args) as rect,
+            patch("main.draw_environment_background") as draw_background,
+        ):
+            self.viewer._render()
+
+        self.assertEqual(update_scene.call_count, 3)
+        self.assertTrue(
+            all(
+                update.args[1] is self.viewer.data
+                for update in update_scene.call_args_list
+            )
+        )
+        self.assertEqual(render.call_count, 3)
+        self.assertEqual(draw_background.call_count, 3)
+        self.assertEqual(
+            rect.call_args_list,
+            [
+                call(200, 700, 600, 400),
+                call(800, 700, 600, 400),
+                call(200, 300, 600, 400),
+            ],
+        )
+        self.assertEqual(
+            [render_call.args[1] for render_call in render.call_args_list], scenes
+        )
+        swap_buffers.assert_called_once_with(self.viewer.window)
+
+    def test_ctrl_left_pick_uses_second_view_scene_and_local_coordinates(self):
+        second_view_id = self.viewer.add_view()
+        first_scene = object()
+        second_scene = object()
+        self.viewer.viewports[0].scene = first_scene
+        self.viewer.viewports[1].scene = second_scene
+        self.viewer.interaction_enabled = True
+        self.viewer.inspector = SimpleNamespace(
+            backend=SimpleNamespace(mouse_button_callback=lambda *_args: None),
+            reveal_body=lambda _body_id: None,
+            content_rect=(0, 0, 800, 600),
+        )
+        self.viewer._update_view_layout(
+            window_size=(800, 600), framebuffer_size=(800, 600)
+        )
+        window = object()
+
+        with (
+            patch(
+                "main.imgui.get_io",
+                return_value=SimpleNamespace(want_capture_mouse=False),
+            ),
+            patch("main.glfw.get_window_attrib", return_value=0),
+            patch("main.glfw.get_window_size", return_value=(800, 600)),
+            patch("main.glfw.get_framebuffer_size", return_value=(800, 600)),
+            patch("main.glfw.get_cursor_pos", return_value=(600.0, 300.0)),
+            patch(
+                "main.pick_geom",
+                return_value=SimpleNamespace(body_id=-1, point=None),
+            ) as pick,
+        ):
+            self.viewer._on_mouse_button(
+                window,
+                glfw.MOUSE_BUTTON_LEFT,
+                glfw.PRESS,
+                glfw.MOD_CONTROL,
+            )
+
+        pick.assert_called_once_with(
+            self.viewer.model,
+            self.viewer.data,
+            self.viewer.option,
+            second_scene,
+            (200.0, 300.0),
+            (400.0, 600.0),
+            (400, 600),
+        )
+        self.assertEqual(self.viewer.active_view_id, second_view_id)
+        self.assertEqual(self.viewer.mouse_view_id, second_view_id)
+
+    def test_closing_mouse_view_clears_buttons_force_and_pending_pick(self):
+        dragged_view_id = self.viewer.add_view()
+        self.viewer.mouse_view_id = dragged_view_id
+        self.viewer.buttons.add(glfw.MOUSE_BUTTON_LEFT)
+        self.viewer.last_cursor = (600.0, 300.0)
+        self.viewer.left_press_origin = (600.0, 300.0)
+        self.viewer.left_dragging = True
+        self.viewer.force_body_id = 1
+        self.viewer.force_vector = np.array([1.0, 2.0, 3.0])
+        self.viewer.data.xfrc_applied[1] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        self.viewer.pending_pick = (dragged_view_id, (600.0, 300.0))
+
+        self.viewer.close_view(dragged_view_id)
+
+        self.assertIsNone(self.viewer.mouse_view_id)
+        self.assertFalse(self.viewer.buttons)
+        self.assertIsNone(self.viewer.last_cursor)
+        self.assertIsNone(self.viewer.left_press_origin)
+        self.assertFalse(self.viewer.left_dragging)
+        self.assertEqual(self.viewer.force_body_id, -1)
+        np.testing.assert_array_equal(self.viewer.force_vector, np.zeros(3))
+        np.testing.assert_array_equal(self.viewer.data.xfrc_applied[1], np.zeros(6))
+        self.assertIsNone(self.viewer.pending_pick)
+
+
 if __name__ == "__main__":
     unittest.main()

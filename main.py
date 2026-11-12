@@ -5,6 +5,7 @@ import queue
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import glfw
@@ -29,6 +30,7 @@ from model_sources import (
     poll_orca_states,
     stream_orca_states,
 )
+from viewport_layout import framebuffer_view_rect, grid_view_rects, view_index_at
 
 
 ZOOM_SPEED = 0.18
@@ -377,6 +379,15 @@ def draw_environment_background(color):
         GL.glPopAttrib()
 
 
+@dataclass
+class ViewState:
+    id: int
+    camera: object
+    scene: object = None
+    rect: object = None
+    framebuffer_rect: tuple | None = None
+
+
 class Viewer:
     def __init__(self, xml_path=None, orca_address=None):
         self.startup_orca_address = orca_address
@@ -405,11 +416,14 @@ class Viewer:
 
         self.center = self.model.stat.center.copy()
         self.extent = _valid_extent(self.model.stat.extent)
-        self.camera = mujoco.MjvCamera()
-        self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        camera = mujoco.MjvCamera()
+        camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        self.viewports = [ViewState(0, camera)]
+        self.active_view_id = 0
+        self.next_view_id = 1
+        self.mouse_view_id = None
         self.option = mujoco.MjvOption()
         self.option.geomgroup[:] = 1
-        self.scene = None
         self.context = None
         self.window = None
         self.model_index = ModelIndex(self.model)
@@ -461,6 +475,98 @@ class Viewer:
     def model_name(self):
         return self.xml_path.name if self.xml_path is not None else "未加载模型"
 
+    def _view_by_id(self, view_id):
+        return next((view for view in self.viewports if view.id == view_id), None)
+
+    @property
+    def active_view(self):
+        view = self._view_by_id(self.active_view_id)
+        if view is None:
+            view = self.viewports[0]
+            self.active_view_id = view.id
+        return view
+
+    @property
+    def camera(self):
+        return self.active_view.camera
+
+    @camera.setter
+    def camera(self, camera):
+        self.active_view.camera = camera
+
+    @property
+    def scene(self):
+        return self.active_view.scene
+
+    @scene.setter
+    def scene(self, scene):
+        self.active_view.scene = scene
+
+    def add_view(self):
+        source = self.active_view
+        camera = mujoco.MjvCamera()
+        camera.type = source.camera.type
+        camera.azimuth = source.camera.azimuth
+        camera.elevation = source.camera.elevation
+        camera.distance = source.camera.distance
+        camera.lookat[:] = source.camera.lookat
+        scene = (
+            mujoco.MjvScene(self.model, maxgeom=10000)
+            if source.scene is not None
+            else None
+        )
+        view = ViewState(self.next_view_id, camera, scene)
+        self.next_view_id += 1
+        self.viewports.append(view)
+        self.active_view_id = view.id
+        return view.id
+
+    def close_view(self, view_id):
+        if len(self.viewports) == 1:
+            return
+        index = next(
+            (index for index, view in enumerate(self.viewports) if view.id == view_id),
+            None,
+        )
+        if index is None:
+            return
+        was_active = view_id == self.active_view_id
+        del self.viewports[index]
+        if was_active:
+            self.active_view_id = self.viewports[min(index, len(self.viewports) - 1)].id
+        if self.mouse_view_id == view_id:
+            self.mouse_view_id = None
+            self.buttons.clear()
+            self.last_cursor = None
+            self.left_press_origin = None
+            self.left_dragging = False
+            self._clear_external_force()
+        if self.pending_pick is not None and self.pending_pick[0] == view_id:
+            self.pending_pick = None
+
+    def _update_view_layout(self, window_size=None, framebuffer_size=None):
+        window_size = window_size or glfw.get_window_size(self.window)
+        framebuffer_size = framebuffer_size or glfw.get_framebuffer_size(self.window)
+        content_rect = getattr(self.inspector, "content_rect", None)
+        if content_rect is None:
+            content_rect = (0.0, 0.0, float(window_size[0]), float(window_size[1]))
+        rects = grid_view_rects(len(self.viewports), *content_rect)
+        if not rects:
+            for view in self.viewports:
+                view.rect = None
+                view.framebuffer_rect = None
+            return
+        for view, rect in zip(self.viewports, rects):
+            view.rect = rect
+            view.framebuffer_rect = framebuffer_view_rect(
+                rect, window_size, framebuffer_size
+            )
+
+    def _view_at_cursor(self, cursor):
+        self._update_view_layout()
+        index = view_index_at([view.rect for view in self.viewports], cursor)
+        return self.viewports[index] if index is not None else None
+
     def _set_source_status(self, text, error=False):
         if self.inspector is not None:
             self.inspector.set_source_status(text, error)
@@ -499,7 +605,11 @@ class Viewer:
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
         model_index = ModelIndex(model)
-        scene = mujoco.MjvScene(model, maxgeom=10000) if self.scene is not None else None
+        scenes = (
+            [mujoco.MjvScene(model, maxgeom=10000) for _view in self.viewports]
+            if self.scene is not None
+            else [None] * len(self.viewports)
+        )
         context = None
         try:
             if self.context is not None:
@@ -510,12 +620,12 @@ class Viewer:
             if context is not None:
                 context.free()
             raise
-        return model, data, model_index, scene, context, effective_xml_text
+        return model, data, model_index, scenes, context, effective_xml_text
 
     def _commit_model(
         self, path, base_xml_text, ground_enabled, candidate
     ):
-        model, data, model_index, scene, context, effective_xml_text = candidate
+        model, data, model_index, scenes, context, effective_xml_text = candidate
         self.stop_orca_sync()
         self.stop_orca_push()
         self._clear_external_force()
@@ -529,7 +639,8 @@ class Viewer:
         self.model = model
         self.data = data
         self.model_index = model_index
-        self.scene = scene
+        for view, scene in zip(self.viewports, scenes):
+            view.scene = scene
         self.context = context
         self.center = model.stat.center.copy()
         self.extent = _valid_extent(model.stat.extent)
@@ -549,7 +660,7 @@ class Viewer:
             self.inspector.rebind_model(
                 model, data, model_index, self.model_name, self.effective_xml_text
             )
-        self._reset_camera()
+        self._reset_all_cameras()
         self._update_title()
         if old_context is not None:
             old_context.free()
@@ -1020,20 +1131,28 @@ class Viewer:
                 self.orca_sync_connected = True
                 self._set_source_status("OrcaLab 主仿真（正在拉取状态）")
 
-    def _aspect_ratio(self):
+    def _aspect_ratio(self, view=None):
+        view = view or self.active_view
+        if view.rect is not None and view.rect.height > 0:
+            return view.rect.width / view.rect.height
         if self.window is None:
             return 1.0
         width, height = glfw.get_framebuffer_size(self.window)
         return width / height if height > 0 and width > 0 else 1.0
 
-    def _reset_camera(self):
+    def _reset_camera(self, view=None):
+        view = view or self.active_view
         reset_camera(
-            self.camera,
+            view.camera,
             self.center,
             self.extent,
             self.model.vis.global_.fovy,
-            self._aspect_ratio(),
+            self._aspect_ratio(view),
         )
+
+    def _reset_all_cameras(self):
+        for view in self.viewports:
+            self._reset_camera(view)
 
     def _update_title(self):
         if self.window is None:
@@ -1077,24 +1196,30 @@ class Viewer:
                     return
             if imgui.get_io().want_capture_mouse:
                 return
+            cursor = glfw.get_cursor_pos(window)
+            view = self._view_at_cursor(cursor)
+            if view is None:
+                return
+            self.active_view_id = view.id
+            self.mouse_view_id = view.id
             self.buttons.add(button)
-            self.last_cursor = glfw.get_cursor_pos(window)
+            self.last_cursor = cursor
             if button == glfw.MOUSE_BUTTON_LEFT:
                 self.left_press_origin = self.last_cursor
                 self.left_dragging = False
                 if (
                     self.interaction_enabled
                     and mods & glfw.MOD_CONTROL
-                    and self.scene is not None
+                    and view.scene is not None
                 ):
                     picked = pick_geom(
                         self.model,
                         self.data,
                         self.option,
-                        self.scene,
-                        self.last_cursor,
-                        glfw.get_window_size(window),
-                        glfw.get_framebuffer_size(window),
+                        view.scene,
+                        (cursor[0] - view.rect.x, cursor[1] - view.rect.y),
+                        (view.rect.width, view.rect.height),
+                        view.framebuffer_rect[2:],
                     )
                     if picked.body_id > 0 and picked.point is not None:
                         point = np.asarray(picked.point, dtype=float)
@@ -1121,12 +1246,14 @@ class Viewer:
                 and is_click(self.left_press_origin, cursor)
                 and not imgui.get_io().want_capture_mouse
             ):
-                self.pending_pick = cursor
+                self.pending_pick = (self.mouse_view_id, cursor)
             if button == glfw.MOUSE_BUTTON_LEFT:
                 self._clear_external_force()
                 self.left_press_origin = None
                 self.left_dragging = False
             self.last_cursor = cursor if self.buttons else None
+            if not self.buttons:
+                self.mouse_view_id = None
 
     def _on_cursor_pos(self, window, x, y):
         self.inspector.backend.mouse_callback(window, x, y)
@@ -1171,6 +1298,11 @@ class Viewer:
         if self.last_cursor is None:
             self.last_cursor = (x, y)
             return
+        view = self._view_by_id(self.mouse_view_id)
+        if view is None or view.rect is None:
+            self.buttons.clear()
+            self._clear_external_force()
+            return
 
         dx = x - self.last_cursor[0]
         dy = y - self.last_cursor[1]
@@ -1180,22 +1312,21 @@ class Viewer:
                 self.left_dragging = True
             if self.left_dragging and self.force_body_id > 0:
                 self.force_target = self.force_start + interaction_drag(
-                    self.camera,
+                    view.camera,
                     (x - self.left_press_origin[0], y - self.left_press_origin[1]),
-                    glfw.get_window_size(window)[1],
+                    view.rect.height,
                     self.model.vis.global_.fovy,
                     self.force_start,
                 )
                 self._update_interaction_force()
             elif self.left_dragging:
-                orbit_camera(self.camera, dx, dy)
+                orbit_camera(view.camera, dx, dy)
         else:
-            _width, height = glfw.get_window_size(self.window)
             pan_camera(
-                self.camera,
+                view.camera,
                 dx,
                 dy,
-                height,
+                view.rect.height,
                 self.model.vis.global_.fovy,
                 self.extent,
                 self.pan_speed,
@@ -1203,8 +1334,12 @@ class Viewer:
 
     def _on_scroll(self, window, x_offset, y_offset):
         self.inspector.backend.scroll_callback(window, x_offset, y_offset)
-        if not imgui.get_io().want_capture_mouse:
-            zoom_camera(self.camera, self.extent, y_offset, self.zoom_speed)
+        if imgui.get_io().want_capture_mouse:
+            return
+        view = self._view_at_cursor(glfw.get_cursor_pos(window))
+        if view is not None:
+            self.active_view_id = view.id
+            zoom_camera(view.camera, self.extent, y_offset, self.zoom_speed)
 
     def _on_focus(self, _window, focused):
         if not focused:
@@ -1218,6 +1353,7 @@ class Viewer:
             self.resize_edges = ()
             self.resize_origin = None
             self.pending_pick = None
+            self.mouse_view_id = None
 
     def _on_key(self, window, key, scancode, action, mods):
         self.inspector.backend.keyboard_callback(window, key, scancode, action, mods)
@@ -1266,9 +1402,14 @@ class Viewer:
         if self.inspector is not None and imgui.get_io().want_capture_keyboard:
             self.movement_keys.clear()
         if self.movement_keys:
-            _width, height = glfw.get_window_size(self.window)
+            view = self.active_view
+            height = (
+                view.rect.height
+                if view.rect is not None
+                else glfw.get_window_size(self.window)[1]
+            )
             keyboard_move_camera(
-                self.camera,
+                view.camera,
                 self.movement_keys,
                 frame_time,
                 height,
@@ -1297,14 +1438,39 @@ class Viewer:
             self.accumulator = 0.0
         self._queue_orca_push_state()
 
+    def _update_view_scene(self, view):
+        mujoco.mjv_updateScene(
+            self.model,
+            self.data,
+            self.option,
+            None,
+            view.camera,
+            mujoco.mjtCatBit.mjCAT_ALL,
+            view.scene,
+        )
+        near = max(
+            view.camera.distance * self.near_clip_ratio, np.finfo(float).tiny
+        )
+        far = max(view.camera.distance + self.extent * 10.0, near * 1000.0)
+        for camera in view.scene.camera:
+            if camera.frustum_near > 0.0:
+                near_scale = near / camera.frustum_near
+                camera.frustum_top *= near_scale
+                camera.frustum_bottom *= near_scale
+            camera.frustum_near = near
+            camera.frustum_far = far
+
     def _render(self):
         width, height = glfw.get_framebuffer_size(self.window)
         if width <= 0 or height <= 0:
             return
 
+        window_size = glfw.get_window_size(self.window)
         self.inspector.begin_frame()
         self.inspector.local_running = self.running
         self.inspector.force_strength = self.force_strength
+        self.inspector.view_ids = [view.id for view in self.viewports]
+        self.inspector.active_view_id = self.active_view_id
         previous_zoom_speed = self.zoom_speed
         (
             self.selection,
@@ -1320,79 +1486,107 @@ class Viewer:
             self.near_clip_ratio,
         )
         self.force_strength = self.inspector.force_strength
+        self._update_view_layout(window_size, (width, height))
         if self.zoom_speed != previous_zoom_speed:
             self._update_title()
         focus_body = self.inspector.consume_focus_request()
         if focus_body is not None:
+            view = self.active_view
             max_distance = None
             if self.selection.joint_id >= 0:
                 center, radius = joint_focus(
                     self.model, self.data, self.selection.joint_id
                 )
-                max_distance = self.camera.distance
+                max_distance = view.camera.distance
             else:
                 center, radius = body_focus(
                     self.model, self.data, self.model_index, focus_body
                 )
             focus_camera(
-                self.camera,
+                view.camera,
                 center,
                 radius,
                 self.model.vis.global_.fovy,
-                self._aspect_ratio(),
+                self._aspect_ratio(view),
                 max_distance=max_distance,
             )
-        mujoco.mjv_updateScene(
-            self.model,
-            self.data,
-            self.option,
-            None,
-            self.camera,
-            mujoco.mjtCatBit.mjCAT_ALL,
-            self.scene,
-        )
-        near = max(
-            self.camera.distance * self.near_clip_ratio, np.finfo(float).tiny
-        )
-        far = max(self.camera.distance + self.extent * 10.0, near * 1000.0)
-        for camera in self.scene.camera:
-            if camera.frustum_near > 0.0:
-                near_scale = near / camera.frustum_near
-                camera.frustum_top *= near_scale
-                camera.frustum_bottom *= near_scale
-            camera.frustum_near = near
-            camera.frustum_far = far
+        for view in self.viewports:
+            if (
+                view.scene is not None
+                and view.rect is not None
+                and view.rect.width > 0
+                and view.rect.height > 0
+            ):
+                self._update_view_scene(view)
 
         if self.pending_pick is not None:
-            self.selection = pick_geom(
-                self.model,
-                self.data,
-                self.option,
-                self.scene,
-                self.pending_pick,
-                glfw.get_window_size(self.window),
-                (width, height),
-            )
+            view_id, cursor = self.pending_pick
+            view = self._view_by_id(view_id)
             self.pending_pick = None
-            if self.selection.valid:
-                self.inspector.reveal_body(self.selection.body_id)
-        apply_highlight(self.scene, self.selection, self.model_index)
-        if self.force_body_id > 0:
-            visual_extent = min(
-                self.extent, max(self.camera.distance * 0.35, 1e-6)
-            )
-            draw_interaction_force(
-                self.scene, self.force_point, self.force_vector, visual_extent
-            )
-            draw_interaction_target(
-                self.scene, self.force_point, self.force_target, visual_extent
-            )
+            if (
+                view is not None
+                and view.scene is not None
+                and view.rect is not None
+                and view.framebuffer_rect is not None
+            ):
+                self.selection = pick_geom(
+                    self.model,
+                    self.data,
+                    self.option,
+                    view.scene,
+                    (cursor[0] - view.rect.x, cursor[1] - view.rect.y),
+                    (view.rect.width, view.rect.height),
+                    view.framebuffer_rect[2:],
+                )
+                self.active_view_id = view.id
+                if self.selection.valid:
+                    self.inspector.reveal_body(self.selection.body_id)
 
-        viewport = mujoco.MjrRect(0, 0, width, height)
-        mujoco.mjr_render(viewport, self.scene, self.context)
-        if self.environment_preset == "blue":
-            draw_environment_background(ENVIRONMENT_BACKGROUNDS["blue"])
-        self.inspector.draw_object_label(self.selection, self.scene, (width, height))
+        background = ENVIRONMENT_BACKGROUNDS[self.environment_preset]
+        GL.glDisable(GL.GL_SCISSOR_TEST)
+        GL.glViewport(0, 0, width, height)
+        GL.glClearColor(*background)
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+        for view in self.viewports:
+            if (
+                view.scene is None
+                or view.framebuffer_rect is None
+                or view.framebuffer_rect[2] <= 0
+                or view.framebuffer_rect[3] <= 0
+            ):
+                continue
+            apply_highlight(view.scene, self.selection, self.model_index)
+            if self.force_body_id > 0:
+                visual_extent = min(
+                    self.extent, max(view.camera.distance * 0.35, 1e-6)
+                )
+                draw_interaction_force(
+                    view.scene, self.force_point, self.force_vector, visual_extent
+                )
+                draw_interaction_target(
+                    view.scene, self.force_point, self.force_target, visual_extent
+                )
+            left, bottom, view_width, view_height = view.framebuffer_rect
+            GL.glEnable(GL.GL_SCISSOR_TEST)
+            GL.glScissor(left, bottom, view_width, view_height)
+            GL.glViewport(left, bottom, view_width, view_height)
+            mujoco.mjr_render(
+                mujoco.MjrRect(left, bottom, view_width, view_height),
+                view.scene,
+                self.context,
+            )
+            if self.environment_preset == "blue":
+                draw_environment_background(background)
+        GL.glDisable(GL.GL_SCISSOR_TEST)
+        active = self.active_view
+        if active.scene is not None and active.rect is not None:
+            self.inspector.draw_object_label(
+                self.selection,
+                active.scene,
+                active.framebuffer_rect[2:],
+                window_size=(active.rect.width, active.rect.height),
+                window_offset=(active.rect.x, active.rect.y),
+            )
         self.inspector.end_frame()
         glfw.swap_buffers(self.window)
 
@@ -1432,6 +1626,8 @@ class Viewer:
             self.inspector.on_reset_simulation = self.reset_interaction
             self.inspector.on_push_state = self.push_local_state
             self.inspector.on_ground_change = self.set_ground_enabled
+            self.inspector.on_add_view = self.add_view
+            self.inspector.on_close_view = self.close_view
             self.inspector.on_exit = lambda: glfw.set_window_should_close(self.window, True)
             self.inspector.rebind_model(
                 self.model,

@@ -98,6 +98,11 @@ class InspectorUI:
         self.on_push_state = None
         self.on_exit = None
         self.on_ground_change = None
+        self.on_add_view = None
+        self.on_close_view = None
+        self.view_ids = [0]
+        self.active_view_id = 0
+        self.content_rect = None
         self.exit_popup_open = False
         self.ground_injected = False
         self.mode = "view"
@@ -357,6 +362,12 @@ class InspectorUI:
         panel_height = max(0, window_height - TITLE_BAR_HEIGHT)
         panel_width = min(self.right_panel_width, window_width)
         tree_width = min(self.left_panel_width, window_width - panel_width)
+        self.content_rect = (
+            float(tree_width),
+            float(TITLE_BAR_HEIGHT),
+            max(0.0, window_width - tree_width - panel_width),
+            float(panel_height),
+        )
         flags = (
             imgui.WindowFlags_.no_collapse
             | imgui.WindowFlags_.no_move
@@ -407,6 +418,26 @@ class InspectorUI:
 
                     display_tab, _open = imgui.begin_tab_item("显示设置")
                     if display_tab:
+                        imgui.separator_text("三维视图")
+                        if imgui.button("+ 添加视图") and self.on_add_view is not None:
+                            self.on_add_view()
+                        imgui.same_line()
+                        imgui.text_disabled(f"{len(self.view_ids)} 个视图")
+                        for view_id in self.view_ids:
+                            if view_id == self.active_view_id:
+                                imgui.text_colored(
+                                    (1.0, 0.75, 0.3, 1.0), f"视图 {view_id + 1}（活动）"
+                                )
+                            else:
+                                imgui.text(f"视图 {view_id + 1}")
+                            imgui.same_line()
+                            imgui.begin_disabled(len(self.view_ids) == 1)
+                            if (
+                                imgui.button(f"关闭##view_{view_id}")
+                                and self.on_close_view is not None
+                            ):
+                                self.on_close_view(view_id)
+                            imgui.end_disabled()
                         environment_preset = self._draw_environment(environment_preset)
                         imgui.text("近切面距离 (相机距离 %)")
                         imgui.set_next_item_width(-1)
@@ -488,7 +519,9 @@ class InspectorUI:
         self.scroll_body = None
         return selection, zoom_speed, pan_speed, environment_preset, near_clip_ratio
 
-    def draw_object_label(self, selection, scene, framebuffer_size):
+    def draw_object_label(
+        self, selection, scene, framebuffer_size, window_size=None, window_offset=(0, 0)
+    ):
         if not selection.valid:
             return
         if selection.joint_id >= 0:

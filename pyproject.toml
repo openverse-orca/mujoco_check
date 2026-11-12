@@ -26,4 +26,5 @@ py-modules = [
     "inspector_ui",
     "model_injection",
     "model_sources",
+    "viewport_layout",
 ]
