@@ -6,7 +6,7 @@ from unittest.mock import patch
 import mujoco
 import numpy as np
 
-from inspection import (
+from mtool.inspection import (
     ModelIndex,
     Selection,
     apply_highlight,
@@ -119,7 +119,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(relative_cursor_position(20, 30, 100, 200), (0.2, 0.85))
         self.assertIsNone(relative_cursor_position(20, 30, 0, 200))
 
-    @patch("inspection.mujoco.mjv_select")
+    @patch("mtool.inspection.mujoco.mjv_select")
     def test_pick_uses_framebuffer_aspect_and_accepts_world_body(self, select):
         def select_world(_model, _data, _option, aspect, relx, rely, *_args):
             self.assertEqual(aspect, 2.0)
@@ -142,7 +142,7 @@ class SelectionTests(unittest.TestCase):
             result, Selection(body_id=0, geom_id=0, point=(1.0, 2.0, 3.0))
         )
 
-    @patch("inspection.mujoco.mjv_select")
+    @patch("mtool.inspection.mujoco.mjv_select")
     def test_invalid_size_and_blank_click_clear_selection(self, select):
         result = pick_geom(
             self.model,

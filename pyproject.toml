@@ -13,18 +13,11 @@ dependencies = [
 ]
 
 [project.scripts]
-mtool = "main:main"
+mtool = "mtool.main:main"
 
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = [
-    "main",
-    "inspection",
-    "inspector_ui",
-    "model_injection",
-    "model_sources",
-    "viewport_layout",
-]
+packages = ["mtool"]

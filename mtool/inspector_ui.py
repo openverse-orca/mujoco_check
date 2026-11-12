@@ -5,7 +5,7 @@ import mujoco
 from imgui_bundle import imgui, portable_file_dialogs
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 
-from inspection import body_focus, project_to_window
+from .inspection import body_focus, project_to_window
 
 
 APP_NAME = "MuJoCo 模型检查器"

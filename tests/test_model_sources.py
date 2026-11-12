@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import numpy as np
 from orca_gym.core import orca_gym_local
-from model_sources import (
+from mtool.model_sources import (
     cleanup_orca_fetch,
     download_orca_xml,
     fetch_orca_xml,
@@ -18,9 +18,9 @@ from model_sources import (
 
 
 class DownloadOrcaXmlTests(unittest.IsolatedAsyncioTestCase):
-    @patch("model_sources.OrcaGymLocal")
-    @patch("model_sources.GrpcServiceStub")
-    @patch("model_sources.grpc.aio.insecure_channel")
+    @patch("mtool.model_sources.OrcaGymLocal")
+    @patch("mtool.model_sources.GrpcServiceStub")
+    @patch("mtool.model_sources.grpc.aio.insecure_channel")
     async def test_download_passes_arguments_and_closes_channel(
         self, insecure_channel, stub_class, gym_class
     ):
@@ -31,7 +31,7 @@ class DownloadOrcaXmlTests(unittest.IsolatedAsyncioTestCase):
         gym.load_model_xml = AsyncMock(return_value="/tmp/cache/scene.xml")
         directory = Path("/tmp/cache")
 
-        with patch("model_sources.asyncio.wait_for", wraps=asyncio.wait_for) as wait_for:
+        with patch("mtool.model_sources.asyncio.wait_for", wraps=asyncio.wait_for) as wait_for:
             result = await download_orca_xml(
                 "localhost:50051", directory, timeout=12.5
             )
@@ -48,9 +48,9 @@ class DownloadOrcaXmlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wait_for.await_args.kwargs, {"timeout": 12.5})
         channel.close.assert_awaited_once_with()
 
-    @patch("model_sources.OrcaGymLocal")
-    @patch("model_sources.GrpcServiceStub")
-    @patch("model_sources.grpc.aio.insecure_channel")
+    @patch("mtool.model_sources.OrcaGymLocal")
+    @patch("mtool.model_sources.GrpcServiceStub")
+    @patch("mtool.model_sources.grpc.aio.insecure_channel")
     async def test_file_lock_avoids_main_thread_signals(
         self, insecure_channel, _stub_class, gym_class
     ):
@@ -72,9 +72,9 @@ class DownloadOrcaXmlTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(orca_gym_local.file_lock, original_lock)
 
-    @patch("model_sources.OrcaGymLocal")
-    @patch("model_sources.GrpcServiceStub")
-    @patch("model_sources.grpc.aio.insecure_channel")
+    @patch("mtool.model_sources.OrcaGymLocal")
+    @patch("mtool.model_sources.GrpcServiceStub")
+    @patch("mtool.model_sources.grpc.aio.insecure_channel")
     async def test_timeout_closes_channel(self, insecure_channel, _stub_class, gym_class):
         channel = insecure_channel.return_value
         channel.close = AsyncMock()
@@ -90,9 +90,9 @@ class DownloadOrcaXmlTests(unittest.IsolatedAsyncioTestCase):
 
         channel.close.assert_awaited_once_with()
 
-    @patch("model_sources.OrcaGymLocal")
-    @patch("model_sources.GrpcServiceStub")
-    @patch("model_sources.grpc.aio.insecure_channel")
+    @patch("mtool.model_sources.OrcaGymLocal")
+    @patch("mtool.model_sources.GrpcServiceStub")
+    @patch("mtool.model_sources.grpc.aio.insecure_channel")
     async def test_load_error_propagates_and_closes_channel(
         self, insecure_channel, _stub_class, gym_class
     ):
@@ -109,9 +109,9 @@ class DownloadOrcaXmlTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PollOrcaStatesTests(unittest.IsolatedAsyncioTestCase):
-    @patch("model_sources.OrcaGymRemote")
-    @patch("model_sources.GrpcServiceStub")
-    @patch("model_sources.grpc.aio.insecure_channel")
+    @patch("mtool.model_sources.OrcaGymRemote")
+    @patch("mtool.model_sources.GrpcServiceStub")
+    @patch("mtool.model_sources.grpc.aio.insecure_channel")
     async def test_poll_publishes_state_and_closes_channel(
         self, insecure_channel, stub_class, gym_class
     ):
@@ -142,9 +142,9 @@ class PollOrcaStatesTests(unittest.IsolatedAsyncioTestCase):
         gym_class.assert_called_once_with(stub_class.return_value)
         channel.close.assert_awaited_once_with()
 
-    @patch("model_sources.OrcaGymRemote")
-    @patch("model_sources.GrpcServiceStub")
-    @patch("model_sources.grpc.aio.insecure_channel")
+    @patch("mtool.model_sources.OrcaGymRemote")
+    @patch("mtool.model_sources.GrpcServiceStub")
+    @patch("mtool.model_sources.grpc.aio.insecure_channel")
     async def test_query_error_propagates_and_closes_channel(
         self, insecure_channel, _stub_class, gym_class
     ):
@@ -165,10 +165,10 @@ class PollOrcaStatesTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StreamOrcaStatesTests(unittest.IsolatedAsyncioTestCase):
-    @patch("model_sources.OrcaGymLocal")
-    @patch("model_sources.OrcaGymRemote")
-    @patch("model_sources.GrpcServiceStub")
-    @patch("model_sources.grpc.aio.insecure_channel")
+    @patch("mtool.model_sources.OrcaGymLocal")
+    @patch("mtool.model_sources.OrcaGymRemote")
+    @patch("mtool.model_sources.GrpcServiceStub")
+    @patch("mtool.model_sources.grpc.aio.insecure_channel")
     async def test_stream_pauses_once_and_pushes_visual_state(
         self, insecure_channel, stub_class, gym_class, visual_gym_class
     ):
@@ -220,10 +220,10 @@ class StreamOrcaStatesTests(unittest.IsolatedAsyncioTestCase):
         visual_gym_class.assert_called_once_with(stub_class.return_value)
         channel.close.assert_awaited_once_with()
 
-    @patch("model_sources.OrcaGymLocal")
-    @patch("model_sources.OrcaGymRemote")
-    @patch("model_sources.GrpcServiceStub")
-    @patch("model_sources.grpc.aio.insecure_channel")
+    @patch("mtool.model_sources.OrcaGymLocal")
+    @patch("mtool.model_sources.OrcaGymRemote")
+    @patch("mtool.model_sources.GrpcServiceStub")
+    @patch("mtool.model_sources.grpc.aio.insecure_channel")
     async def test_stream_error_propagates_and_closes_channel(
         self, insecure_channel, _stub_class, gym_class, visual_gym_class
     ):
@@ -263,9 +263,9 @@ class FetchOrcaXmlTests(unittest.TestCase):
             return xml_path
 
         with (
-            patch("model_sources.Path.home", return_value=self.home),
+            patch("mtool.model_sources.Path.home", return_value=self.home),
             patch(
-                "model_sources.download_orca_xml", side_effect=fake_download
+                "mtool.model_sources.download_orca_xml", side_effect=fake_download
             ) as download,
         ):
             first_xml, first_dir = fetch_orca_xml("localhost:50051", timeout=4.5)
@@ -303,8 +303,8 @@ class FetchOrcaXmlTests(unittest.TestCase):
             raise error
 
         with (
-            patch("model_sources.Path.home", return_value=self.home),
-            patch("model_sources.download_orca_xml", side_effect=fail_download),
+            patch("mtool.model_sources.Path.home", return_value=self.home),
+            patch("mtool.model_sources.download_orca_xml", side_effect=fail_download),
         ):
             with self.assertRaises(RuntimeError) as caught:
                 fetch_orca_xml("localhost:50051", timeout=7.0)

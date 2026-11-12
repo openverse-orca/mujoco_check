@@ -11,8 +11,8 @@ import glfw
 import mujoco
 import numpy as np
 
-from inspection import project_to_window
-from main import (
+from mtool.inspection import project_to_window
+from mtool.main import (
     Viewer,
     MIN_CLOSE_ZOOM_FACTOR,
     ENVIRONMENT_BACKGROUNDS,
@@ -33,6 +33,9 @@ from main import (
     window_resize_edges,
     zoom_camera,
 )
+
+
+SCENE_PATH = Path(__file__).with_name("small_scene.xml")
 
 
 class CameraTests(unittest.TestCase):
@@ -197,7 +200,7 @@ class CameraTests(unittest.TestCase):
         self.assertAlmostEqual(np.linalg.norm(self.camera.lookat), reference_length)
 
     def test_vertical_pan_matches_render_camera_up_without_changing_depth(self):
-        model = mujoco.MjModel.from_xml_path("small_scene.xml")
+        model = mujoco.MjModel.from_xml_path(str(SCENE_PATH))
         data = mujoco.MjData(model)
         scene = mujoco.MjvScene(model, maxgeom=100)
         camera = mujoco.MjvCamera()
@@ -239,7 +242,7 @@ class InteractionForceTests(unittest.TestCase):
         np.testing.assert_allclose(up, [0.0, 0.0, expected_length])
 
     def test_drag_target_projects_back_to_mouse_position(self):
-        viewer = Viewer("small_scene.xml")
+        viewer = Viewer(SCENE_PATH)
         viewer.camera.azimuth = 45.0
         viewer.camera.elevation = -30.0
         scene = mujoco.MjvScene(viewer.model, maxgeom=100)
@@ -298,7 +301,7 @@ class InteractionForceTests(unittest.TestCase):
         self.assertAlmostEqual(float(np.linalg.norm(limited)), 20.0)
 
     def test_force_arrow_follows_grasp_point_and_force_direction(self):
-        model = mujoco.MjModel.from_xml_path("small_scene.xml")
+        model = mujoco.MjModel.from_xml_path(str(SCENE_PATH))
         scene = mujoco.MjvScene(model, maxgeom=100)
         original_geom_count = model.ngeom
         point = np.array([0.2, 0.1, 0.3])
@@ -316,7 +319,7 @@ class InteractionForceTests(unittest.TestCase):
         np.testing.assert_allclose(arrow.mat[:, 2], [1.0, 0.0, 0.0], atol=1e-6)
 
     def test_target_marker_and_line_are_decorative(self):
-        model = mujoco.MjModel.from_xml_path("small_scene.xml")
+        model = mujoco.MjModel.from_xml_path(str(SCENE_PATH))
         scene = mujoco.MjvScene(model, maxgeom=100)
 
         draw_interaction_target(scene, np.zeros(3), np.array([1.0, 0.0, 0.0]), 2.0)
@@ -327,7 +330,7 @@ class InteractionForceTests(unittest.TestCase):
         np.testing.assert_allclose(scene.geoms[1].pos, [1.0, 0.0, 0.0])
 
     def test_zero_force_does_not_add_scene_geometry(self):
-        model = mujoco.MjModel.from_xml_path("small_scene.xml")
+        model = mujoco.MjModel.from_xml_path(str(SCENE_PATH))
         scene = mujoco.MjvScene(model, maxgeom=100)
 
         draw_interaction_force(scene, np.zeros(3), np.zeros(3), 2.0)
@@ -377,9 +380,9 @@ class WindowFrameTests(unittest.TestCase):
         viewer.last_cursor = (780, 580)
 
         with (
-            patch("main.glfw.get_window_pos", return_value=(100, 100)),
-            patch("main.glfw.get_window_size", return_value=(800, 600)),
-            patch("main.glfw.set_window_size") as set_window_size,
+            patch("mtool.main.glfw.get_window_pos", return_value=(100, 100)),
+            patch("mtool.main.glfw.get_window_size", return_value=(800, 600)),
+            patch("mtool.main.glfw.set_window_size") as set_window_size,
         ):
             for total_x, total_y in ((50, 40), (100, 80), (150, 120)):
                 viewer._on_cursor_pos(
@@ -405,10 +408,10 @@ class WindowFrameTests(unittest.TestCase):
 
         with (
             patch(
-                "main.imgui.get_io",
+                "mtool.main.imgui.get_io",
                 return_value=SimpleNamespace(want_capture_keyboard=False),
             ),
-            patch("main.glfw.set_window_should_close") as set_should_close,
+            patch("mtool.main.glfw.set_window_should_close") as set_should_close,
         ):
             viewer._on_key(object(), glfw.KEY_ESCAPE, 0, glfw.PRESS, 0)
 
@@ -494,7 +497,7 @@ class LocalInteractionTests(unittest.TestCase):
         )
 
     def test_modes_are_mutually_exclusive(self):
-        with patch("main.threading.Thread") as thread_class:
+        with patch("mtool.main.threading.Thread") as thread_class:
             self.viewer.set_mode("interaction", "localhost:50051")
             self.assertTrue(self.viewer.interaction_enabled)
             self.assertTrue(self.viewer.running)
@@ -518,7 +521,7 @@ class LocalInteractionTests(unittest.TestCase):
             self.assertTrue(stop_event.is_set())
 
     def test_leaving_interaction_restores_initial_simulation_state(self):
-        with patch("main.threading.Thread"):
+        with patch("mtool.main.threading.Thread"):
             self.viewer.set_mode("interaction", "localhost:50051")
         self.viewer.data.qpos[0] += 0.01
         self.viewer.data.qvel[:] = 0.25
@@ -541,7 +544,7 @@ class LocalInteractionTests(unittest.TestCase):
         self.viewer._step_simulation()
         np.testing.assert_array_equal(self.viewer.data.qvel, original_qvel)
 
-        with patch("main.threading.Thread"):
+        with patch("mtool.main.threading.Thread"):
             self.viewer.set_mode("interaction", "localhost:50051")
         self.viewer.toggle_interaction_running()
         self.assertFalse(self.viewer.running)
@@ -561,13 +564,13 @@ class LocalInteractionTests(unittest.TestCase):
         self.viewer.inspector.reveal_body = lambda _body_id: None
         window = object()
         with (
-            patch("main.imgui.get_io", return_value=SimpleNamespace(want_capture_mouse=False)),
-            patch("main.glfw.get_window_attrib", return_value=0),
-            patch("main.glfw.get_window_size", return_value=(800, 600)),
-            patch("main.glfw.get_framebuffer_size", return_value=(800, 600)),
-            patch("main.glfw.get_cursor_pos", return_value=(400.0, 300.0)),
+            patch("mtool.main.imgui.get_io", return_value=SimpleNamespace(want_capture_mouse=False)),
+            patch("mtool.main.glfw.get_window_attrib", return_value=0),
+            patch("mtool.main.glfw.get_window_size", return_value=(800, 600)),
+            patch("mtool.main.glfw.get_framebuffer_size", return_value=(800, 600)),
+            patch("mtool.main.glfw.get_cursor_pos", return_value=(400.0, 300.0)),
             patch(
-                "main.pick_geom",
+                "mtool.main.pick_geom",
                 return_value=SimpleNamespace(
                     body_id=1, point=tuple(self.viewer.data.xpos[1])
                 ),
@@ -738,7 +741,7 @@ class OrcaPushTests(unittest.TestCase):
     def test_push_starts_one_stream_and_keeps_only_latest_snapshot(self):
         self.viewer.data.qpos[2] = 0.02
         self.viewer.data.time = 1.25
-        with patch("main.threading.Thread") as thread_class:
+        with patch("mtool.main.threading.Thread") as thread_class:
             self.viewer.push_local_state(" localhost:50051 ")
             self.viewer.data.qpos[2] = 0.04
             self.viewer.data.time = 2.5
@@ -760,7 +763,7 @@ class OrcaPushTests(unittest.TestCase):
         self.assertTrue(self.viewer.inspector.orca_push_busy)
 
     def test_simulation_loop_automatically_queues_current_state(self):
-        with patch("main.threading.Thread"):
+        with patch("mtool.main.threading.Thread"):
             self.viewer.push_local_state("localhost:50051")
         self.viewer.orca_push_states.get_nowait()
         self.viewer.data.qpos[2] = 0.03
@@ -786,7 +789,7 @@ class OrcaPushTests(unittest.TestCase):
             on_pushed(pushed_id)
             received_stop.set()
 
-        with patch("main.stream_orca_states", new_callable=AsyncMock) as stream:
+        with patch("mtool.main.stream_orca_states", new_callable=AsyncMock) as stream:
             stream.side_effect = fake_stream
             self.viewer._orca_push_worker(
                 request_id, "localhost:50051", state_queue, stop_event
@@ -828,7 +831,7 @@ class OrcaPushTests(unittest.TestCase):
         )
 
     def test_push_validation_does_not_start_worker(self):
-        with patch("main.threading.Thread") as thread_class:
+        with patch("mtool.main.threading.Thread") as thread_class:
             self.viewer.push_local_state("  ")
             self.viewer.interaction_enabled = False
             self.viewer.push_local_state("localhost:50051")
@@ -867,7 +870,7 @@ class OrcaSyncTests(unittest.TestCase):
             set_source_status=lambda _text, _error=False: None,
         )
         viewer.running = True
-        with patch("main.threading.Thread") as thread_class:
+        with patch("mtool.main.threading.Thread") as thread_class:
             viewer.start_orca_sync(" localhost:50051 ")
             stop_event = viewer.orca_sync_stop
 
@@ -1102,14 +1105,14 @@ class MultiViewTests(unittest.TestCase):
         )
 
         with (
-            patch("main.glfw.get_framebuffer_size", return_value=(1600, 1200)),
-            patch("main.glfw.get_window_size", return_value=(800, 600)),
-            patch("main.GL"),
-            patch("main.glfw.swap_buffers") as swap_buffers,
-            patch("main.mujoco.mjv_updateScene") as update_scene,
-            patch("main.mujoco.mjr_render") as render,
-            patch("main.mujoco.MjrRect", side_effect=lambda *args: args) as rect,
-            patch("main.draw_environment_background") as draw_background,
+            patch("mtool.main.glfw.get_framebuffer_size", return_value=(1600, 1200)),
+            patch("mtool.main.glfw.get_window_size", return_value=(800, 600)),
+            patch("mtool.main.GL"),
+            patch("mtool.main.glfw.swap_buffers") as swap_buffers,
+            patch("mtool.main.mujoco.mjv_updateScene") as update_scene,
+            patch("mtool.main.mujoco.mjr_render") as render,
+            patch("mtool.main.mujoco.MjrRect", side_effect=lambda *args: args) as rect,
+            patch("mtool.main.draw_environment_background") as draw_background,
         ):
             self.viewer._render()
 
@@ -1154,15 +1157,15 @@ class MultiViewTests(unittest.TestCase):
 
         with (
             patch(
-                "main.imgui.get_io",
+                "mtool.main.imgui.get_io",
                 return_value=SimpleNamespace(want_capture_mouse=False),
             ),
-            patch("main.glfw.get_window_attrib", return_value=0),
-            patch("main.glfw.get_window_size", return_value=(800, 600)),
-            patch("main.glfw.get_framebuffer_size", return_value=(800, 600)),
-            patch("main.glfw.get_cursor_pos", return_value=(600.0, 300.0)),
+            patch("mtool.main.glfw.get_window_attrib", return_value=0),
+            patch("mtool.main.glfw.get_window_size", return_value=(800, 600)),
+            patch("mtool.main.glfw.get_framebuffer_size", return_value=(800, 600)),
+            patch("mtool.main.glfw.get_cursor_pos", return_value=(600.0, 300.0)),
             patch(
-                "main.pick_geom",
+                "mtool.main.pick_geom",
                 return_value=SimpleNamespace(body_id=-1, point=None),
             ) as pick,
         ):

@@ -14,7 +14,7 @@ import numpy as np
 from imgui_bundle import imgui
 from OpenGL import GL
 
-from inspection import (
+from .inspection import (
     ModelIndex,
     Selection,
     apply_highlight,
@@ -22,15 +22,15 @@ from inspection import (
     joint_focus,
     pick_geom,
 )
-from inspector_ui import APP_NAME, InspectorUI
-from model_injection import inject_ground, joint_layout
-from model_sources import (
+from .inspector_ui import APP_NAME, InspectorUI
+from .model_injection import inject_ground, joint_layout
+from .model_sources import (
     cleanup_orca_fetch,
     fetch_orca_xml,
     poll_orca_states,
     stream_orca_states,
 )
-from viewport_layout import framebuffer_view_rect, grid_view_rects, view_index_at
+from .viewport_layout import framebuffer_view_rect, grid_view_rects, view_index_at
 
 
 ZOOM_SPEED = 0.18

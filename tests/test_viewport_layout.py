@@ -1,6 +1,6 @@
 import unittest
 
-from viewport_layout import (
+from mtool.viewport_layout import (
     ViewRect,
     framebuffer_view_rect,
     grid_view_rects,
