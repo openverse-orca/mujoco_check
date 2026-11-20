@@ -80,3 +80,12 @@ uv run mtool /path/to/model.xml
 | Home | 恢复全景视角 |
 | Ctrl + 鼠标左键拖动 | 对 Body 施加外力 |
 | Esc | 打开退出确认窗口 |
+
+## 兼容性
+
+兼容 Windows 与 Ubuntu。界面中文依赖系统中文字体，程序会按顺序自动加载第一块可用字体，无需额外安装：
+
+- **Windows**：微软雅黑（`msyh.ttc`），不存在时依次回退到黑体（`simhei.ttf`）、宋体（`simsun.ttc`）。
+- **Ubuntu**：Noto Sans CJK，不存在时回退到 Droid Sans Fallback。
+
+未找到任何候选字体时，界面中文会显示为问号，请安装上述任意一款字体后重试。

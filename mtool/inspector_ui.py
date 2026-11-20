@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import glfw
@@ -13,9 +14,19 @@ TITLE_BAR_HEIGHT = 52
 SPLITTER_WIDTH = 18
 
 
+# 中文字体候选，按顺序加载第一个存在的字体。
+# ImGui 默认字体只含拉丁字形，未加载中文字体时界面中文会显示为问号。
+# 兼容 Windows（微软雅黑/黑体/宋体）与 Ubuntu（Noto Sans CJK/Droid Sans Fallback）。
+WINDOWS_FONT_DIR = Path(
+    os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
+) / "Fonts"
+
 FONT_CANDIDATES = (
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    WINDOWS_FONT_DIR / "msyh.ttc",
+    WINDOWS_FONT_DIR / "simhei.ttf",
+    WINDOWS_FONT_DIR / "simsun.ttc",
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"),
 )
 
 
@@ -139,8 +150,9 @@ class InspectorUI:
             io = imgui.get_io()
             for font_path in FONT_CANDIDATES:
                 if Path(font_path).is_file():
-                    io.font_default = io.fonts.add_font_from_file_ttf(font_path, 36.0)
-                    self.label_font = io.fonts.add_font_from_file_ttf(font_path, 20.0)
+                    font_file = str(Path(font_path).resolve())
+                    io.font_default = io.fonts.add_font_from_file_ttf(font_file, 36.0)
+                    self.label_font = io.fonts.add_font_from_file_ttf(font_file, 20.0)
                     break
             self.backend = GlfwRenderer(window, attach_callbacks=False)
         except Exception:
